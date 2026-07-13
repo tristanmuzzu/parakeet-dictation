@@ -1,10 +1,14 @@
-# Parakeet Dictation
+# Parakeet Dictation 🎙️
 
 Talk to your AI instead of typing to it. For free, forever, no word limit.
 
+![How it works: press Ctrl+Win, talk, and the text lands in seconds](docs/demo.gif)
+
 If you vibe-code with Cursor, Claude Code, ChatGPT or anything like them, you already know the slow part is typing out the prompt. Talking is faster. The problem is every good voice tool wants a subscription. Wispr Flow is the one most devs use and it's genuinely great, but you pay for it and it counts your words.
 
-This does the same job for nothing. Press Ctrl+Win, say whatever you want for as long as you want, press it again, and the text lands wherever your cursor is: your agent's chat box, a commit message, an email, anywhere. No word count. No monthly fee. No account. No limits, ever.
+This does the same job for nothing. Press Ctrl+Win, say whatever you want for as long as you want, press it again, and the text lands wherever your cursor is: your agent's chat box, a commit message, an email, anywhere. It transcribes in the background *while you're still talking*, so even a minute-long ramble pastes in about two or three seconds after you stop. ⚡
+
+No word count. No monthly fee. No account. No limits, ever.
 
 It runs a real speech model on your own machine (NVIDIA's Parakeet), so the quality is actually good, not the junk you get from the free built-in dictation. It handles 25 languages, figures out which one you're speaking on its own, and punctuates for you. It also runs fully offline, if that's your thing, but the point is that it's free and unlimited.
 
