@@ -77,7 +77,7 @@ Right-click `install-autostart.ps1`, "Run with PowerShell", say yes to the one a
 
 ## The nerdy bit
 
-Two processes. A tiny one holds the keyboard shortcut, the little pill, and the mic. A second one loads the model and does the actual recognition. They're split on purpose: Windows quietly kills a keyboard hook if the process holding it hogs the CPU, and loading a 600 MB model does exactly that, so the model is kept well away from the part that listens for your shortcut. Recognition uses [onnx-asr](https://github.com/istupakov/onnx-asr) with int8 weights on the CPU. Your text goes in with a clipboard paste, and it puts your old clipboard back afterward so nothing gets clobbered.
+Two processes. A tiny one holds the keyboard shortcut, the little pill, and the mic. A second one loads the model and does the actual recognition. They're split on purpose: Windows quietly kills a keyboard hook if the process holding it hogs the CPU, and loading a 600 MB model does exactly that, so the model is kept well away from the part that listens for your shortcut. Recognition uses [onnx-asr](https://github.com/istupakov/onnx-asr) with int8 weights on the CPU. Your text goes in with a clipboard paste, and it stays in the clipboard afterward on purpose, so you can paste it again anywhere.
 
 Everything happens on your machine. Your audio never goes anywhere. The only time it touches the internet is that one model download on the first run.
 
