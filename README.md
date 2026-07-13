@@ -1,64 +1,68 @@
 # Parakeet Dictation
 
-**Free, offline voice dictation for Windows.** Press **Ctrl+Win**, talk, press **Ctrl+Win** again — your words are typed into whatever app has focus (chat, browser, Word, IDE, anywhere).
+Talk to your AI instead of typing to it. For free, forever, no word limit.
 
-No subscription, no cloud, no account. Speech recognition runs entirely on your laptop CPU using NVIDIA's open [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) model — near state-of-the-art quality in 25 European languages (English, Italian, German, French, Spanish, ...) with automatic language detection and punctuation.
+If you vibe-code with Cursor, Claude Code, ChatGPT or anything like them, you already know the slow part is typing out the prompt. Talking is faster. The problem is every good voice tool wants a subscription. Wispr Flow is the one most devs use and it's genuinely great, but you pay for it and it counts your words.
 
-Built as a free replacement for paid dictation apps (Wispr Flow and friends).
+This does the same job for nothing. Press Ctrl+Win, say whatever you want for as long as you want, press it again, and the text lands wherever your cursor is: your agent's chat box, a commit message, an email, anywhere. No word count. No monthly fee. No account. No limits, ever.
 
-## Setup — the easy way (let your AI do it)
+It runs a real speech model on your own machine (NVIDIA's Parakeet), so the quality is actually good, not the junk you get from the free built-in dictation. It handles 25 languages, figures out which one you're speaking on its own, and punctuates for you. It also runs fully offline, if that's your thing, but the point is that it's free and unlimited.
 
-Give this repository to any capable AI assistant (Claude Code, Codex, Cursor, ...) and say:
+## Why this exists
 
-> Clone https://github.com/tristanmuzzu/parakeet-dictation and set it up for me, following its AGENTS.md.
+I was paying for Wispr Flow just to talk to my coding agents all day. Then a friend pointed out you can run the speech model yourself with a small script and skip the subscription entirely. So I did. Now I talk to Claude and Cursor for free and never once think about a word limit. Figured other people stuck paying the same tax might want it too.
 
-[`AGENTS.md`](AGENTS.md) is a step-by-step runbook written for AI agents — setup, verification, and the known failure modes with fixes.
+## Get it running
 
-## Setup — by hand (3 steps, ~5 minutes)
+You need Windows 10 or 11, Python 3.10 to 3.12 ([grab it here](https://www.python.org/downloads/), tick "Add to PATH" during install), and a mic.
 
-Requirements: Windows 10/11, Python 3.10–3.12 ([download](https://www.python.org/downloads/), tick "Add to PATH"), a microphone.
+**The lazy way (let your AI set it up):** hand this repo to Claude Code, Codex, Cursor, whatever you've got, and say:
 
-1. **Download** this repo (green "Code" button → Download ZIP → extract, or `git clone`).
-2. **Install**: right-click `setup.ps1` → *Run with PowerShell* (creates a private Python environment, installs dependencies).
-3. **First run**: double-click **`Start Dictation (debug).bat`**. The first launch downloads the speech model (~460 MB, one time). When the small amber dot in the bottom-right corner disappears, it's ready.
+> Clone https://github.com/tristanmuzzu/parakeet-dictation and set it up for me, follow the AGENTS.md.
 
-Daily use: double-click **`Start Dictation.bat`** (runs silently in the background), or install auto-start (below) and never think about it again.
+[`AGENTS.md`](AGENTS.md) is a runbook written for AI agents. It has every command, how to check it worked, and the handful of things that can go wrong with the fixes.
 
-## Usage
+**By hand (three steps, about five minutes):**
 
-| Keys | Action |
+1. Download this repo (green "Code" button, then Download ZIP, then extract) or `git clone` it.
+2. Right-click `setup.ps1` and pick "Run with PowerShell". It builds a private Python environment and installs what it needs.
+3. Double-click `Start Dictation (debug).bat`. The first launch pulls down the speech model (about 460 MB, once). When the little amber dot in the bottom-right corner goes away, you're good.
+
+After that first run, just use `Start Dictation.bat` (it runs quietly in the background), or set up auto-start below and forget it exists.
+
+## Using it
+
+| Keys | What happens |
 |---|---|
-| **Ctrl + Win** | Start recording — a small "Transcribing" pill appears bottom-center |
-| **Ctrl + Win** (again) | Stop — the recognized text is typed into the focused window |
-| **Esc** | Cancel the current recording (nothing is inserted) |
-| **Ctrl + Alt + Q** | Quit the app |
+| **Ctrl + Win** | Starts listening. A small "Transcribing" pill shows up at the bottom of the screen. |
+| **Ctrl + Win** again | Stops, and types what you said into whatever window you're in. |
+| **Esc** | Throws away the current recording, types nothing. |
+| **Ctrl + Alt + Q** | Quits. |
 
-Speak in any supported language — it auto-detects, even sentence by sentence. Light cleanup is applied automatically (removes "um"/"uh"-type fillers, fixes duplicate words and spacing) — pure text processing, no AI rewriting of your words.
+Talk in whatever language you like, even switching mid-sentence. It cleans up the obvious filler ("um", "uh", repeated words, stray spacing) on its own. That's plain text tidying, it does not reword what you said or run it through another AI.
 
-## Auto-start with Windows (optional)
+## Make it start on its own
 
-Right-click `install-autostart.ps1` → *Run with PowerShell* (approve the admin prompt once). Dictation then starts at every login, ready ~15–30 seconds after boot. Remove anytime with `uninstall-autostart.ps1`.
+Right-click `install-autostart.ps1`, "Run with PowerShell", say yes to the one admin prompt. Now it's ready about half a minute after you log in, every time, without you doing anything. Changed your mind? `uninstall-autostart.ps1` removes it.
 
-## Troubleshooting
+## When something's off
 
-- **Ctrl+Win does nothing** → your keyboard may report localized key names (German layouts say `strg` instead of `ctrl`; already handled). Run `tools/keytest.py` to see your layout's names and extend `norm()` in `dictation.py`. Open an issue with your keytest output and locale — happy to add it.
-- **"Model still loading…"** → wait for the amber corner dot to disappear (~15–30 s with the int8 model; ~90 s if it fell back to fp32).
-- **Mic error** → check Windows Settings → Privacy → Microphone, and that a default input device exists.
-- **Nothing pastes** → the target app must accept Ctrl+V paste (virtually all do).
-- **Want a different hotkey?** → edit the `on_key` combo logic in `dictation.py` (see comments), or ask your AI to do it.
+- **Ctrl+Win does nothing.** Your keyboard probably reports its keys under different names (German layouts call Ctrl "strg", for example). English and German are already handled. Run `tools/keytest.py`, press your keys, see what names show up, and add them to `norm()` in `dictation.py`. Or just open an issue with your keytest output and your keyboard's language and I'll add it.
+- **Stuck on "Model still loading".** Give it a bit. The little amber dot in the corner disappears when it's ready (about 15 to 30 seconds normally).
+- **Mic error.** Check Windows Settings, Privacy, Microphone, and that you actually have an input device set.
+- **Nothing gets typed.** The window you're aiming at has to accept a normal Ctrl+V paste. Almost everything does.
+- **Want a different hotkey?** Edit the key logic in `dictation.py` (it's commented), or ask your AI to swap it for you.
 
-## How it works (for the curious)
+## The nerdy bit
 
-Two processes: a featherweight one owns the global hotkey hook, the tiny overlay UI, and microphone capture; a separate worker process loads the ~600 MB ONNX model and serves recognition over a pipe. The split matters: Windows silently kills keyboard hooks belonging to CPU-pegged processes, which is exactly what a model load does. Recognition uses [onnx-asr](https://github.com/istupakov/onnx-asr) (int8 quantized weights, CPU only). Text is inserted via clipboard paste, and your previous clipboard is restored afterward.
+Two processes. A tiny one holds the keyboard shortcut, the little pill, and the mic. A second one loads the model and does the actual recognition. They're split on purpose: Windows quietly kills a keyboard hook if the process holding it hogs the CPU, and loading a 600 MB model does exactly that, so the model is kept well away from the part that listens for your shortcut. Recognition uses [onnx-asr](https://github.com/istupakov/onnx-asr) with int8 weights on the CPU. Your text goes in with a clipboard paste, and it puts your old clipboard back afterward so nothing gets clobbered.
 
-## Privacy
+Everything happens on your machine. Your audio never goes anywhere. The only time it touches the internet is that one model download on the first run.
 
-Everything runs locally. Audio never leaves your machine. The only network access is the one-time model download from Hugging Face on first run.
+## Free, and yours
 
-## Licenses & credits
+The code is [MIT](LICENSE), do what you want with it.
 
-- **This code**: [MIT](LICENSE).
-- **Speech model**: [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) by NVIDIA, licensed [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). The model is **not** distributed with this repo — it downloads from Hugging Face (ONNX conversion: [istupakov/parakeet-tdt-0.6b-v3-onnx](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx)) on first run under its own license.
-- **Key dependencies**: [onnx-asr](https://github.com/istupakov/onnx-asr) (Apache-2.0), [sounddevice](https://github.com/spatialaudio/python-sounddevice) (MIT), [keyboard](https://github.com/boppreh/keyboard) (MIT), [pyperclip](https://github.com/asweigart/pyperclip) (BSD-3), NumPy (BSD-3).
+The speech model, [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), is NVIDIA's, under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). It isn't shipped in this repo, it downloads from Hugging Face on first run (the ONNX build is [istupakov/parakeet-tdt-0.6b-v3-onnx](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx)) under its own license.
 
-Thanks to Jonah for the "just run Parakeet locally" nudge that started this.
+Built on [onnx-asr](https://github.com/istupakov/onnx-asr), [sounddevice](https://github.com/spatialaudio/python-sounddevice), [keyboard](https://github.com/boppreh/keyboard), [pyperclip](https://github.com/asweigart/pyperclip), and NumPy. Thanks to Jonah for the nudge that started it.
