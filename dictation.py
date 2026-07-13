@@ -23,14 +23,22 @@ import os
 import queue
 import re
 import socket
+import sys
 import threading
 import time
 import logging
 
 import numpy as np
 
+# Where we write our side files (dictation.log, transcripts.log). Next to the
+# .exe when frozen by PyInstaller (sys.executable is the exe), next to this
+# source file otherwise. Both routes therefore keep their logs beside the thing
+# the user actually launched, and source users see no change at all.
+BASE_DIR = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__)))
+
 logging.basicConfig(
-    filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), "dictation.log"),
+    filename=os.path.join(BASE_DIR, "dictation.log"),
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(processName)s] %(message)s",
 )
@@ -501,8 +509,7 @@ def save_transcript(text):
     next to the app, never committed). Safety net for the day the paste
     lands in the wrong window or the clipboard gets overwritten."""
     try:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "transcripts.log")
+        path = os.path.join(BASE_DIR, "transcripts.log")
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]\n{text}\n\n")
     except Exception:
@@ -700,6 +707,17 @@ def main():
         log.info("another instance already running - exiting")
         return
 
+    # First launch on a fresh machine has to pull ~460 MB of model weights from
+    # Hugging Face before anything works. Source users watch that happen in the
+    # console; exe users have no console, so tell them what the wait is via the
+    # status pill. If the snapshot is already cached we skip the message and keep
+    # the quiet amber loading dot.
+    hf_snapshot = os.path.join(
+        os.path.expanduser("~"), ".cache", "huggingface", "hub",
+        "models--istupakov--parakeet-tdt-0.6b-v3-onnx")
+    model_cached = os.path.isdir(hf_snapshot)
+    log.info("model cache present: %s (%s)", model_cached, hf_snapshot)
+
     # Spawn the model worker FIRST, before any UI, so its heavy load never
     # shares a process with the keyboard hook.
     parent_conn, child_conn = mp.Pipe()
@@ -712,7 +730,12 @@ def main():
     root = tk.Tk()
     root.title("Parakeet Dictation")
     ov = Overlay(root)
-    ui_q.put(("loading",))
+    if model_cached:
+        ui_q.put(("loading",))
+    else:
+        # The normal ("hide",) on worker-ready clears this once the download and
+        # load finish.
+        ui_q.put(("status", "Downloading speech model (one time, ~460 MB)"))
 
     def wait_ready():
         try:

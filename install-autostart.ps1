@@ -10,14 +10,25 @@ if (-not $isAdmin) {
 }
 
 $dir = $PSScriptRoot
-$pyw = Join-Path $dir ".venv\Scripts\pythonw.exe"
-if (-not (Test-Path $pyw)) {
-    Write-Host "Virtual environment not found. Run setup.ps1 first." -ForegroundColor Red
-    pause; exit 1
-}
 $user = "$env:USERDOMAIN\$env:USERNAME"
 
-$action    = New-ScheduledTaskAction -Execute $pyw -Argument "dictation.py" -WorkingDirectory $dir
+# Prefer the bundled exe (one-click build) if it sits next to this script;
+# otherwise fall back to the from-source venv. The two routes share one model
+# cache and the single-instance lock, so whichever we register, only one copy
+# ever runs.
+$exe = Join-Path $dir "ParakeetDictation.exe"
+if (Test-Path $exe) {
+    Write-Host "Found ParakeetDictation.exe - registering the packaged build." -ForegroundColor Cyan
+    $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $dir
+} else {
+    $pyw = Join-Path $dir ".venv\Scripts\pythonw.exe"
+    if (-not (Test-Path $pyw)) {
+        Write-Host "No ParakeetDictation.exe and no virtual environment. Run setup.ps1 first, or use the packaged build." -ForegroundColor Red
+        pause; exit 1
+    }
+    Write-Host "Registering the from-source build (.venv)." -ForegroundColor Cyan
+    $action = New-ScheduledTaskAction -Execute $pyw -Argument "dictation.py" -WorkingDirectory $dir
+}
 $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $user
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
