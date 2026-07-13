@@ -202,6 +202,7 @@ def stop_and_transcribe():
                 log.info("ASR result: %d chars -> %d after cleanup",
                          len(payload), len(out))
                 if out:
+                    save_transcript(out)
                     paste_text(out)
             else:
                 ui_q.put(("status", f"ASR error: {payload}"))
@@ -217,22 +218,28 @@ def stop_and_transcribe():
     threading.Thread(target=work, daemon=True).start()
 
 
+def save_transcript(text):
+    """Append the transcription to a local history file (transcripts.log,
+    next to the app, never committed). Safety net for the day the paste
+    lands in the wrong window or the clipboard gets overwritten."""
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "transcripts.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]\n{text}\n\n")
+    except Exception:
+        log.exception("could not save transcript history")
+
+
 def paste_text(text):
     import keyboard
     import pyperclip
 
-    try:
-        old = pyperclip.paste()
-    except Exception:
-        old = ""
     pyperclip.copy(text)
     time.sleep(0.06)
     keyboard.send("ctrl+v")
-    time.sleep(0.18)
-    try:
-        pyperclip.copy(old)
-    except Exception:
-        pass
+    # The transcription deliberately STAYS in the clipboard, so if the paste
+    # went to the wrong window (or nowhere), Ctrl+V drops it anywhere you like.
 
 
 def toggle():
