@@ -82,6 +82,10 @@ def test_fuzzy_phrase_variants():
     # "fave direkt" only clears the bar on the phrase mean (fave is a stretch
     # on its own, direkt is exact), which is exactly the point of averaging.
     assert dictation.apply_dictionary("fave direkt") == "FeWo direkt"
+    # Live evidence 2026-07-13: Parakeet rendered the brand as "Fible direct"
+    # and "Fable Direct". Caught via the b->v sound class.
+    assert dictation.apply_dictionary("add Fible direct to the plan") == "add FeWo direkt to the plan"
+    assert dictation.apply_dictionary("maybe to Fable Direct and more") == "maybe to FeWo direkt and more"
     print("ok test_fuzzy_phrase_variants")
 
 

@@ -155,13 +155,14 @@ _dict_lock = threading.Lock()
 
 _VOWELS = frozenset("aeiou")
 _UMLAUTS = str.maketrans({"ä": "a", "ö": "o", "ü": "u", "ß": "s"})
-_SOUND_SINGLE = str.maketrans({"c": "k", "w": "v", "z": "s", "y": "i", "j": "i"})
+_SOUND_SINGLE = str.maketrans({"c": "k", "w": "v", "b": "v", "z": "s", "y": "i", "j": "i"})
 
 
 def sound_key(word):
     """Reduce a word to a rough phonetic skeleton, so words that SOUND alike map
     to the same key. Cross German/English sound classes, then keep the first
     letter plus the consonant skeleton. Examples: fivo/fewo/fave -> 'fv',
+    fible/fable -> 'fvl' (b and v/w are mishearing neighbors, seen live),
     direct/direkt -> 'drkt'. Returns '' for a word with no usable letters."""
     s = (word or "").lower().translate(_UMLAUTS)
     # Multi-letter sound classes first, longest/most-specific ahead of the rest
@@ -779,7 +780,10 @@ def stop_and_transcribe():
             # Personal dictionary fixes the model's known misfires (names,
             # brands) on the joined text BEFORE clean_text. Both the segmented
             # and the whole-take fallback path funnel through `joined`, so this
-            # one call covers them both.
+            # one call covers them both. The raw line makes "did the model even
+            # transcribe that word or did a correction eat it" answerable from
+            # the log alone (local file, same privacy as transcripts.log).
+            log.info("raw ASR text: %r", joined)
             joined = apply_dictionary(joined)
             # clean_text runs ONCE on the joined text, so filler/dup collapsing
             # works across segment boundaries just like the single-shot path did.
