@@ -72,6 +72,18 @@ def asr_worker(conn):
     import numpy as np  # noqa: F401  (worker-side import)
     import onnx_asr
 
+    # Run recognition at above-normal priority so a busy machine (other heavy
+    # background processes) can't starve it into multi-minute transcriptions.
+    if os.name == "nt":
+        try:
+            import ctypes
+            ABOVE_NORMAL = 0x00008000
+            k32 = ctypes.windll.kernel32
+            k32.SetPriorityClass(k32.GetCurrentProcess(), ABOVE_NORMAL)
+            log.info("worker: priority set to ABOVE_NORMAL")
+        except Exception:
+            log.exception("worker: could not raise priority")
+
     try:
         t0 = time.time()
         try:
