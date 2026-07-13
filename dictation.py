@@ -27,6 +27,8 @@ import threading
 import time
 import logging
 
+import numpy as np
+
 logging.basicConfig(
     filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), "dictation.log"),
     level=logging.INFO,
@@ -41,6 +43,22 @@ MIN_SECONDS = 0.3  # ignore taps shorter than this
 # raw keyboard hook in main() — see on_key() and the comment there for why
 # add_hotkey() string combos are NOT used.
 CLEANUP = True     # strip filler words (um/uh/...) and tidy spacing
+
+# Incremental transcription tuning. The whole point of streaming is to move the
+# ASR cost off the critical path: we chop the take into speech segments while
+# the user is still talking and transcribe each in the background, so only the
+# final tail is left to recognize when they hit stop. These numbers control the
+# RMS-energy segmenter (no VAD library on purpose — one more dependency for a
+# job cheap arithmetic already does well enough).
+FRAME_MS = 30            # RMS is measured over ~30 ms frames
+MIN_SEG = 3.0            # need this many seconds of speech before a silence cut
+MAX_SEG = 20.0           # hard cut here even with no pause, so latency is bounded
+SILENCE_CUT = 0.6        # trailing silence that triggers a speech-based cut
+KEEP_SIL = 0.2           # trailing silence kept after trimming a cut segment
+CALIB_SEC = 0.3          # first slice used to estimate the room's noise floor
+ABS_FLOOR = 0.004        # RMS below this is silence no matter what calibration says
+FLOOR_MULT = 3.0         # speech must exceed this multiple of the learned floor
+EMA_ALPHA = 0.05         # how fast the noise floor tracks (slow, non-speech only)
 
 # Standalone filler tokens (EN + DE), removed only as whole words. Conservative
 # on purpose: does NOT touch "like"/"you know" etc. so meaning is never damaged.
@@ -63,6 +81,111 @@ def clean_text(t):
     if t:
         t = t[0].upper() + t[1:]
     return t
+
+
+# ----------------------------------------------------------------------------
+# Segmenter: pure, deterministic speech chopping (no I/O, no threads).
+#
+# It eats raw audio blocks and decides where to cut the take into segments the
+# worker can transcribe independently. Kept side-effect free so it is trivially
+# unit-testable with synthetic arrays — the streaming plumbing that feeds it and
+# ships the pieces to the worker lives entirely in AsrSession.
+# ----------------------------------------------------------------------------
+class Segmenter:
+    def __init__(self, sr=SAMPLE_RATE):
+        self.sr = sr
+        self.frame_len = max(1, int(sr * FRAME_MS / 1000))
+        self._pending = np.zeros(0, dtype="float32")   # samples < one full frame
+        # Start at the absolute floor and let calibration + EMA refine it. The
+        # floor is deliberately NOT reset between segments: the room does not
+        # get quieter halfway through a dictation.
+        self._floor = ABS_FLOOR
+        self._calib_remaining = int(CALIB_SEC * sr)
+        self._calib_sum = 0.0
+        self._calib_count = 0
+        self._reset_segment()
+
+    def _reset_segment(self):
+        self._seg = []            # frames making up the current (open) segment
+        self._seg_len = 0         # total samples in the current segment
+        self._speech_samples = 0  # samples classified as speech in it
+        self._trailing_sil = 0    # consecutive silence samples at the very end
+
+    def push(self, block):
+        """Consume one audio block (1-D float32 @ sr). Returns a list of cut
+        segments (numpy arrays), most often empty."""
+        block = np.asarray(block, dtype="float32").reshape(-1)
+        out = []
+        if block.size == 0:
+            return out
+        buf = np.concatenate([self._pending, block]) if self._pending.size else block
+        n = buf.size // self.frame_len
+        used = n * self.frame_len
+        self._pending = buf[used:].copy()   # carry the ragged tail to next push
+        for i in range(n):
+            frame = buf[i * self.frame_len:(i + 1) * self.frame_len]
+            seg = self._step(frame, allow_emit=True)
+            if seg is not None and seg.size:
+                out.append(seg)
+        return out
+
+    def finalize(self):
+        """Flush the remaining tail at stop time. May be short; we still emit it
+        as long as it carries real speech, because it holds the user's last
+        words and must never be dropped."""
+        if self._pending.size:
+            self._step(self._pending, allow_emit=False)
+            self._pending = np.zeros(0, dtype="float32")
+        if not self._seg:
+            return None
+        concat = np.concatenate(self._seg)
+        speech_ok = self._speech_samples >= MIN_SECONDS * self.sr
+        # Safety net: if calibration got polluted (the user spoke with no leading
+        # silence) speech frames can be misread as silence, so also emit when the
+        # tail simply carries sound above the absolute floor for long enough.
+        rms = float(np.sqrt(np.mean(concat * concat))) if concat.size else 0.0
+        loud_ok = concat.size >= MIN_SECONDS * self.sr and rms > ABS_FLOOR
+        self._reset_segment()
+        return concat if (speech_ok or loud_ok) else None
+
+    def _step(self, frame, allow_emit):
+        rms = float(np.sqrt(np.mean(frame * frame))) if frame.size else 0.0
+        self._seg.append(frame)
+        self._seg_len += frame.size
+        if self._calib_remaining > 0:
+            self._calib_sum += rms
+            self._calib_count += 1
+            self._calib_remaining -= frame.size
+            if self._calib_remaining <= 0:
+                self._floor = self._calib_sum / max(1, self._calib_count)
+        thresh = max(self._floor * FLOOR_MULT, ABS_FLOOR)
+        if rms > thresh:
+            self._speech_samples += frame.size
+            self._trailing_sil = 0
+        else:
+            self._trailing_sil += frame.size
+            if self._calib_remaining <= 0:   # track the floor on true silence only
+                self._floor = (1 - EMA_ALPHA) * self._floor + EMA_ALPHA * rms
+        if not allow_emit:
+            return None
+        # Cut A: enough speech banked and a real pause has landed. Trim the pause.
+        if (self._speech_samples >= MIN_SEG * self.sr
+                and self._trailing_sil >= SILENCE_CUT * self.sr):
+            return self._cut(trim=True)
+        # Cut B: segment got too long with no pause — cut hard to bound latency.
+        if self._seg_len >= MAX_SEG * self.sr:
+            return self._cut(trim=False)
+        return None
+
+    def _cut(self, trim):
+        concat = np.concatenate(self._seg)
+        if trim:
+            keep = int(KEEP_SIL * self.sr)
+            if self._trailing_sil > keep:
+                drop = self._trailing_sil - keep
+                concat = concat[:max(0, concat.size - drop)]
+        self._reset_segment()
+        return concat
 
 
 # ----------------------------------------------------------------------------
@@ -93,6 +216,16 @@ def asr_worker(conn):
             log.exception("worker: int8 load failed, falling back to fp32")
             model = onnx_asr.load_model(MODEL_NAME)
         log.info("worker: model loaded OK in %.1fs", time.time() - t0)
+        # Warm the graph once on 5s of silence. The first real recognize() pays
+        # a large one-off cost (ONNX session warmup, allocator, thread pool);
+        # paying it here means the first user dictation is fast like the rest.
+        try:
+            t1 = time.time()
+            model.recognize(np.zeros(SAMPLE_RATE * 5, dtype="float32"),
+                            sample_rate=SAMPLE_RATE)
+            log.info("worker: warmup done in %.1fs", time.time() - t1)
+        except Exception:
+            log.exception("worker: warmup failed (non-fatal)")
         conn.send(("ready", None))
     except Exception as e:
         log.exception("worker: model load FAILED")
@@ -126,7 +259,117 @@ frames_lock = threading.Lock()
 stream = None
 worker_conn = None
 worker_lock = threading.Lock()
+session = None          # the live AsrSession while recording / draining the tail
 _lock_sock = None
+
+
+# ----------------------------------------------------------------------------
+# AsrSession: the per-dictation streaming plumbing around the Segmenter.
+#
+# One session per recording. A feeder thread drains freshly captured audio into
+# the Segmenter and queues each emitted segment; a SINGLE consumer thread ships
+# them to the worker one at a time (under worker_lock) and stores the results in
+# submit order. Single consumer = strict FIFO, so segments are never reordered.
+#
+# The consumer sends and recv's as one atomic pair under the lock, so a send is
+# never left without its matching recv — that is what keeps the pipe in sync
+# even when a dictation is cancelled mid-flight (we finish the in-flight recv,
+# then just discard the result).
+# ----------------------------------------------------------------------------
+class AsrSession:
+    def __init__(self, conn, lock):
+        self.conn = conn
+        self.lock = lock
+        self.segmenter = Segmenter()
+        self.seg_q: "queue.Queue" = queue.Queue()
+        self.results = {}          # index -> transcribed text
+        self.cancelled = False
+        self._submitted = 0
+        self._feeding = True
+        self._cursor = 0           # how far into `frames` the feeder has read
+        self._feeder = None
+        self._consumer = threading.Thread(target=self._consume,
+                                          name="asr-consumer", daemon=True)
+        self._consumer.start()
+
+    def start_feeder(self):
+        self._feeder = threading.Thread(target=self._feed,
+                                        name="asr-feeder", daemon=True)
+        self._feeder.start()
+
+    def submit(self, audio):
+        idx = self._submitted
+        self._submitted += 1
+        self.seg_q.put((idx, audio))
+        return idx
+
+    def close(self):
+        self.seg_q.put(None)       # sentinel: consumer drains then exits
+
+    def cancel(self):
+        self.cancelled = True
+        self._feeding = False
+
+    def join_consumer(self, timeout=None):
+        self._consumer.join(timeout)
+
+    def ordered_texts(self):
+        return [self.results[i] for i in range(self._submitted)
+                if self.results.get(i)]
+
+    def _feed(self):
+        # Poll the shared frames buffer rather than doing DSP in the mic
+        # callback, so the audio thread only ever appends and never blocks.
+        while self._feeding:
+            self._drain_frames()
+            time.sleep(0.05)
+
+    def _drain_frames(self):
+        with frames_lock:
+            new = frames[self._cursor:]
+            self._cursor = len(frames)
+        for block in new:
+            for seg in self.segmenter.push(block):
+                if seg.size:
+                    self.submit(seg)
+
+    def stop_feeding(self):
+        """Called on stop: halt the feeder, pick up any last frames, then flush
+        the Segmenter's tail so nothing the user said is left unqueued."""
+        self._feeding = False
+        if self._feeder is not None:
+            self._feeder.join(timeout=2.0)
+        self._drain_frames()
+        tail = self.segmenter.finalize()
+        if tail is not None and tail.size:
+            self.submit(tail)
+
+    def _consume(self):
+        while True:
+            item = self.seg_q.get()
+            if item is None:
+                break
+            if self.cancelled:
+                # Cancelled before this one was sent: nothing is in flight, so
+                # the pipe stays in sync. Just drop it.
+                continue
+            idx, audio = item
+            t0 = time.time()
+            try:
+                with self.lock:
+                    self.conn.send(("recognize", audio, SAMPLE_RATE))
+                    kind, payload = self.conn.recv()
+            except Exception:
+                log.exception("asr consumer roundtrip failed")
+                continue
+            if kind == "text":
+                text = payload or ""
+                log.info("segment %d: %.1fs audio -> %d chars in %.1fs",
+                         idx, len(audio) / SAMPLE_RATE, len(text), time.time() - t0)
+                if not self.cancelled:
+                    self.results[idx] = text
+            else:
+                log.info("segment %d: ASR error: %s", idx, payload)
 
 
 def acquire_single_instance():
@@ -143,13 +386,17 @@ def acquire_single_instance():
 
 
 def start_recording():
-    global stream, frames
+    global stream, frames, session
     import sounddevice as sd
 
     if state["recording"] or state["busy"]:
         return
     with frames_lock:
         frames = []
+    # Spin up the streaming session BEFORE the mic opens, so its feeder starts
+    # transcribing speech in the background the moment audio arrives.
+    session = AsrSession(worker_conn, worker_lock)
+    session.start_feeder()
 
     def cb(indata, n, t, status):
         with frames_lock:
@@ -161,6 +408,9 @@ def start_recording():
         stream.start()
     except Exception as e:
         log.exception("mic open failed")
+        session.cancel()
+        session.close()
+        session = None
         ui_q.put(("status", f"mic error: {e}"))
         threading.Timer(1.8, lambda: ui_q.put(("hide",))).start()
         return
@@ -170,11 +420,13 @@ def start_recording():
 
 
 def stop_and_transcribe():
-    global stream
-    import numpy as np
+    global stream, session
 
     if not state["recording"]:
         return
+    # Stop-to-paste is measured from HERE (the stop hotkey) to just after the
+    # paste lands — that is the latency the user actually feels.
+    t_stop = time.time()
     state["recording"] = False
     try:
         stream.stop()
@@ -182,37 +434,63 @@ def stop_and_transcribe():
     except Exception:
         pass
     stream = None
+    # Keep the whole take around: it is the safety fallback if streaming
+    # produced no segments (very short or very quiet dictation).
     with frames_lock:
         data = np.concatenate(frames) if frames else np.zeros((0, 1), dtype="float32")
     audio = data.reshape(-1).astype("float32")
     log.info("recording stopped: %.1fs audio", audio.size / SAMPLE_RATE)
     if audio.size < SAMPLE_RATE * MIN_SECONDS:
+        if session is not None:
+            session.cancel()
+            session.close()
+            session = None
         ui_q.put(("hide",))
         return
     state["busy"] = True
     ui_q.put(("processing",))
+    sess = session
 
     def work():
+        global session
         try:
-            with worker_lock:
-                worker_conn.send(("recognize", audio, SAMPLE_RATE))
-                kind, payload = worker_conn.recv()
-            if kind == "text":
-                out = clean_text(payload) if CLEANUP else payload
-                log.info("ASR result: %d chars -> %d after cleanup",
-                         len(payload), len(out))
-                if out:
-                    save_transcript(out)
-                    paste_text(out)
+            # Flush the tail through the segmenter, close the queue, and wait for
+            # the consumer to finish. Mid-recording segments are already done, so
+            # this wait is only the (short) tail — that is the whole win.
+            sess.stop_feeding()
+            sess.close()
+            sess.join_consumer()
+            if sess.cancelled:
+                return
+            texts = sess.ordered_texts()
+            if not texts:
+                # Nothing got segmented: fall back to exactly today's behaviour
+                # and transcribe the whole take once.
+                with worker_lock:
+                    worker_conn.send(("recognize", audio, SAMPLE_RATE))
+                    kind, payload = worker_conn.recv()
+                joined = (payload or "").strip() if kind == "text" else ""
+                n_segments = 1
             else:
-                ui_q.put(("status", f"ASR error: {payload}"))
-                time.sleep(1.8)
+                joined = " ".join(texts)
+                n_segments = len(texts)
+            # clean_text runs ONCE on the joined text, so filler/dup collapsing
+            # works across segment boundaries just like the single-shot path did.
+            out = clean_text(joined) if CLEANUP else joined
+            log.info("ASR result: %d chars -> %d after cleanup",
+                     len(joined), len(out))
+            if out:
+                save_transcript(out)
+                paste_text(out)
+            log.info("stop-to-paste: %.1fs (%d segments, %d chars)",
+                     time.time() - t_stop, n_segments, len(out))
         except Exception as e:
-            log.exception("worker roundtrip failed")
+            log.exception("stop/transcribe failed")
             ui_q.put(("status", f"error: {e}"))
             time.sleep(1.8)
         finally:
             state["busy"] = False
+            session = None
             ui_q.put(("hide",))
 
     threading.Thread(target=work, daemon=True).start()
@@ -258,7 +536,7 @@ def toggle():
 
 
 def cancel():
-    global stream
+    global stream, session
     if state["recording"]:
         state["recording"] = False
         try:
@@ -267,6 +545,12 @@ def cancel():
         except Exception:
             pass
         stream = None
+        # Mark the session cancelled: its consumer keeps the pipe in sync but
+        # discards results, nothing is pasted, no transcript is saved.
+        if session is not None:
+            session.cancel()
+            session.close()
+            session = None
         log.info("recording cancelled")
         ui_q.put(("hide",))
 
