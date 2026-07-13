@@ -92,6 +92,300 @@ def clean_text(t):
 
 
 # ----------------------------------------------------------------------------
+# Personal dictionary: teach Parakeet the names and words it keeps getting wrong.
+#
+# A plain-text dictionary.txt next to the app (BASE_DIR) holds the words you care
+# about, one per line. The primary way to use it is to write ONLY the correct
+# spelling:
+#     FeWo direkt
+#     Zeticle
+# and Parakeet fixes anything it transcribes that SOUNDS close, even spellings
+# you never listed ("fivo direct", "fiwo direkt", "fave direkt" all collapse to
+# "FeWo direkt"). That sound-matching is why you never enumerate wrong spellings.
+#
+# For the rare case where phonetics can't bridge the gap, an explicit override
+# is still supported with an arrow — wrong on the left, right on the right, with
+# |-separated alternatives:
+#     cloud code -> Claude Code
+# Explicit overrides run FIRST, then the sound-matching. The file hot-reloads on
+# its mtime, so edits land on your next dictation with no restart.
+# ----------------------------------------------------------------------------
+DICTIONARY_FILE = os.path.join(BASE_DIR, "dictionary.txt")
+
+DICTIONARY_TEMPLATE = """\
+# Teach Parakeet your words. Write the correct spelling, one per line:
+#
+#   FeWo direkt
+#   Zeticle
+#   NeoData
+#
+# Parakeet then fixes anything it hears that SOUNDS like one of these, even
+# spellings you never wrote down. You never list the wrong versions.
+#
+# Only words of four letters or more are matched this way (short words are too
+# easy to confuse for it to be safe).
+#
+# Advanced escape hatch: if a word comes out mangled beyond what sound-matching
+# can catch, add an explicit correction with an arrow (wrong -> right). Several
+# wrong spellings can share a line with |:
+#
+#   cloud code -> Claude Code
+#
+# Explicit corrections run first, then the sound-matching. Lines starting with #
+# are ignored. Edits apply on your next dictation, no restart needed.
+"""
+
+# A "word" is a maximal run of letters (Unicode-aware: German umlauts count).
+# Digits, punctuation and spaces separate words and are never matched into one.
+_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+# Only entries whose every word is at least this long are sound-matched. Short
+# words (a, on, code) collide with far too much to correct safely by sound.
+MIN_FUZZY_LEN = 4
+# A candidate window must clear BOTH bars to be replaced: its sound-keys must be
+# this similar on average, and its raw letters must be at least loosely similar
+# (the raw bar is a sanity guard against absurd sound-only collisions).
+SOUND_SIM_MIN = 0.70
+RAW_SIM_MIN = 0.45
+
+_dict_rules = []       # explicit overrides: (compiled_regex, replacement), longest-left first
+_dict_entries = []     # sound-matched entries (dicts), longest phrase first
+_dict_mtime = None     # mtime the current data was built from (None = unloaded)
+_dict_lock = threading.Lock()
+
+_VOWELS = frozenset("aeiou")
+_UMLAUTS = str.maketrans({"ä": "a", "ö": "o", "ü": "u", "ß": "s"})
+_SOUND_SINGLE = str.maketrans({"c": "k", "w": "v", "z": "s", "y": "i", "j": "i"})
+
+
+def sound_key(word):
+    """Reduce a word to a rough phonetic skeleton, so words that SOUND alike map
+    to the same key. Cross German/English sound classes, then keep the first
+    letter plus the consonant skeleton. Examples: fivo/fewo/fave -> 'fv',
+    direct/direkt -> 'drkt'. Returns '' for a word with no usable letters."""
+    s = (word or "").lower().translate(_UMLAUTS)
+    # Multi-letter sound classes first, longest/most-specific ahead of the rest
+    # so "sch" wins over "ch" and "ch" is handled before a bare "c".
+    for a, b in (("sch", "s"), ("ph", "f"), ("ch", "k"), ("ck", "k")):
+        s = s.replace(a, b)
+    s = s.translate(_SOUND_SINGLE)
+    s = "".join(ch for ch in s if "a" <= ch <= "z")    # drop anything left over
+    if not s:
+        return ""
+    skel = s[0] + "".join(ch for ch in s[1:] if ch not in _VOWELS)
+    out = []                                            # collapse doubled letters
+    for ch in skel:
+        if not out or out[-1] != ch:
+            out.append(ch)
+    return "".join(out)
+
+
+def _levenshtein(a, b):
+    """Classic edit distance (single-row DP). Small inputs — words, not text."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost))
+        prev = cur
+    return prev[-1]
+
+
+def _sim(a, b):
+    """Similarity in [0,1]: 1 - editdistance/longer. Two empties are identical."""
+    m = max(len(a), len(b))
+    if m == 0:
+        return 1.0
+    return 1.0 - _levenshtein(a, b) / m
+
+
+def ensure_dictionary_file():
+    """Create dictionary.txt with the commented template on first run, so the
+    user (exe or source) always has a file to edit and nothing to set up."""
+    try:
+        if not os.path.exists(DICTIONARY_FILE):
+            with open(DICTIONARY_FILE, "w", encoding="utf-8") as f:
+                f.write(DICTIONARY_TEMPLATE)
+            log.info("dictionary: created template at %s", DICTIONARY_FILE)
+    except Exception:
+        log.exception("dictionary: could not create template file")
+
+
+def _parse_dictionary(text):
+    """Parse dictionary text into explicit overrides and sound-matched entries.
+    A line with '->' is an explicit override (left|alts -> right); any other
+    non-comment line is a correct-word entry to sound-match against. Malformed
+    lines are skipped with one log line — a single bad line never aborts the
+    rest. Returns (rules, entries, n_words, n_rules)."""
+    flat = []          # explicit: (left_alternative, replacement)
+    entries = []       # sound-matched word entries
+    n_words = 0
+    n_rules = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "->" in line:
+            left, _, right = line.partition("->")
+            right = right.strip()
+            alts = [a.strip() for a in left.split("|") if a.strip()]
+            if not right or not alts:
+                log.info("dictionary: skipping malformed override line: %r", line)
+                continue
+            for a in alts:
+                flat.append((a, right))
+            n_rules += 1
+        else:
+            words = _WORD_RE.findall(line)
+            if not words:
+                log.info("dictionary: skipping unusable line: %r", line)
+                continue
+            n_words += 1
+            # Sound-matching needs every word to clear the length bar; shorter
+            # entries are kept in the count but reachable only via an override.
+            if all(len(w) >= MIN_FUZZY_LEN for w in words):
+                entries.append({
+                    "text": line,
+                    "nwords": len(words),
+                    "keys": [sound_key(w) for w in words],
+                    "raw": [w.lower() for w in words],
+                })
+    # Longest override left-side first, so "cloud code" wins over a bare "cloud".
+    flat.sort(key=lambda pr: len(pr[0]), reverse=True)
+    rules = []
+    for left, right in flat:
+        try:
+            rx = re.compile(r"\b" + re.escape(left) + r"\b", re.IGNORECASE)
+        except Exception:
+            # A bad override is skipped, logged once here at load, never at apply.
+            log.exception("dictionary: skipping unbuildable override %r", left)
+            continue
+        rules.append((rx, right))
+    # Longest phrase first, so a 2-word entry claims its words before a 1-word one.
+    entries.sort(key=lambda e: (e["nwords"], len(e["text"])), reverse=True)
+    return rules, entries, n_words, n_rules
+
+
+def _maybe_reload():
+    """(Re)load when dictionary.txt first appears or its mtime changes. Not
+    thread-safe on its own — callers hold _dict_lock."""
+    global _dict_rules, _dict_entries, _dict_mtime
+    try:
+        mtime = os.path.getmtime(DICTIONARY_FILE)
+    except OSError:
+        return                              # no file: keep whatever we had
+    if mtime == _dict_mtime:
+        return
+    try:
+        with open(DICTIONARY_FILE, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        log.exception("dictionary: could not read file")
+        return
+    _dict_rules, _dict_entries, n_words, n_rules = _parse_dictionary(text)
+    _dict_mtime = mtime
+    log.info("dictionary: %d words, %d explicit rules loaded", n_words, n_rules)
+
+
+def _apply_explicit(text, rules):
+    """Whole-word, case-insensitive override pass. Right side stays verbatim."""
+    out = text
+    replaced = 0
+    for rx, right in rules:
+        # A function replacement keeps the right side literal (no \1 / \g
+        # backreference surprises) and counts hits in one pass.
+        out, n = rx.subn(lambda m, r=right: r, out)
+        replaced += n
+    return out, replaced
+
+
+def _window_matches(win_words, entry):
+    """True when this same-length run of transcribed words sounds like the entry
+    (and is not an absurd raw-letter mismatch). See SOUND_SIM_MIN / RAW_SIM_MIN."""
+    win_keys = [sound_key(w) for w in win_words]
+    ent_keys = entry["keys"]
+    if not win_keys[0] or not ent_keys[0]:
+        return False
+    if win_keys[0][0] != ent_keys[0][0]:            # first sound-mapped letter
+        return False
+    sound = [_sim(a, b) for a, b in zip(win_keys, ent_keys)]
+    if sum(sound) / len(sound) < SOUND_SIM_MIN:
+        return False
+    raw = [_sim(w.lower(), r) for w, r in zip(win_words, entry["raw"])]
+    if sum(raw) / len(raw) < RAW_SIM_MIN:
+        return False
+    return True
+
+
+def _apply_fuzzy(text, entries):
+    """Replace any run of words that sounds like a dictionary entry with the
+    entry's exact spelling. Longest entries first; a run consumed by one
+    replacement is not matched again."""
+    if not entries:
+        return text, 0
+    toks = [(m.group(), m.start(), m.end()) for m in _WORD_RE.finditer(text)]
+    if not toks:
+        return text, 0
+    consumed = [False] * len(toks)
+    repls = []                                        # (start_char, end_char, text)
+    for e in entries:
+        n = e["nwords"]
+        i = 0
+        while i + n <= len(toks):
+            if any(consumed[i:i + n]):
+                i += 1
+                continue
+            window = toks[i:i + n]
+            if _window_matches([w[0] for w in window], e):
+                repls.append((window[0][1], window[-1][2], e["text"]))
+                for j in range(i, i + n):
+                    consumed[j] = True
+                i += n
+            else:
+                i += 1
+    if not repls:
+        return text, 0
+    repls.sort()
+    parts = []
+    last = 0
+    for start, end, rep in repls:
+        parts.append(text[last:start])
+        parts.append(rep)
+        last = end
+    parts.append(text[last:])
+    return "".join(parts), len(repls)
+
+
+def apply_dictionary(text):
+    """Apply personal corrections to a finished transcription: explicit
+    overrides first, then sound-matching. Never throws — a broken dictionary
+    must never break a dictation."""
+    if not text:
+        return text
+    try:
+        with _dict_lock:
+            _maybe_reload()
+            rules = _dict_rules
+            entries = _dict_entries
+        out, n_explicit = _apply_explicit(text, rules)
+        out, n_fuzzy = _apply_fuzzy(out, entries)
+        total = n_explicit + n_fuzzy
+        if total:
+            log.info("dictionary: %d corrections", total)
+        return out
+    except Exception:
+        log.exception("dictionary: apply failed (leaving text unchanged)")
+        return text
+
+
+# ----------------------------------------------------------------------------
 # Segmenter: pure, deterministic speech chopping (no I/O, no threads).
 #
 # It eats raw audio blocks and decides where to cut the take into segments the
@@ -482,6 +776,11 @@ def stop_and_transcribe():
             else:
                 joined = " ".join(texts)
                 n_segments = len(texts)
+            # Personal dictionary fixes the model's known misfires (names,
+            # brands) on the joined text BEFORE clean_text. Both the segmented
+            # and the whole-take fallback path funnel through `joined`, so this
+            # one call covers them both.
+            joined = apply_dictionary(joined)
             # clean_text runs ONCE on the joined text, so filler/dup collapsing
             # works across segment boundaries just like the single-shot path did.
             out = clean_text(joined) if CLEANUP else joined
@@ -706,6 +1005,14 @@ def main():
     if not acquire_single_instance():
         log.info("another instance already running - exiting")
         return
+
+    # Make sure the editable dictionary.txt exists (first run drops the commented
+    # template next to the exe / in the repo root) and load it now, so the rule
+    # count is logged at startup and corrections are ready before the first
+    # dictation. Later edits hot-reload on their own, no restart needed.
+    ensure_dictionary_file()
+    with _dict_lock:
+        _maybe_reload()
 
     # First launch on a fresh machine has to pull ~460 MB of model weights from
     # Hugging Face before anything works. Source users watch that happen in the
