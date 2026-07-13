@@ -16,7 +16,21 @@ It runs a real speech model on your own machine (NVIDIA's Parakeet), so the qual
 
 I was paying for Wispr Flow just to talk to my coding agents all day. Then a friend pointed out you can run the speech model yourself with a small script and skip the subscription entirely. So I did. Now I talk to Claude and Cursor for free and never once think about a word limit. Figured other people stuck paying the same tax might want it too.
 
-## Get it running
+## Get it running (no Python needed)
+
+The easy way. No Python, no setup, nothing to install.
+
+1. Grab `ParakeetDictation-win64.zip` from the [Releases page](https://github.com/tristanmuzzu/parakeet-dictation/releases).
+2. Extract it anywhere you like.
+3. Double-click `ParakeetDictation.exe`.
+
+The first launch pulls down the speech model (about 460 MB, once) and shows a small "Downloading speech model" pill while it does. When that clears, you're good. After that it starts in a second or two.
+
+You need Windows 10 or 11 and a mic. That's it.
+
+**One heads-up about Windows SmartScreen.** The exe isn't code-signed (signing costs money I'd rather not spend on a free tool), so Windows may pop up a blue "Windows protected your PC" box. Click "More info", then "Run anyway". And look, if running an unsigned exe from a stranger on the internet makes you uneasy, that's completely fair. Use the from-source route below instead: you can read every line first, and it's the exact same app.
+
+## From source (you have Python)
 
 You need Windows 10 or 11, Python 3.10 to 3.12 ([grab it here](https://www.python.org/downloads/), tick "Add to PATH" during install), and a mic.
 
@@ -33,6 +47,8 @@ You need Windows 10 or 11, Python 3.10 to 3.12 ([grab it here](https://www.pytho
 3. Double-click `Start Dictation (debug).bat`. The first launch pulls down the speech model (about 460 MB, once). When the little amber dot in the bottom-right corner goes away, you're good.
 
 After that first run, just use `Start Dictation.bat` (it runs quietly in the background), or set up auto-start below and forget it exists.
+
+Both routes share the same model cache and only ever let one copy run at a time, so you can switch between the exe and the source install whenever you want without anything clashing.
 
 ## Using it
 

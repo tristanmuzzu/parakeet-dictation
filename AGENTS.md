@@ -4,6 +4,8 @@ You are setting up free, unlimited voice dictation on the user's **Windows** mac
 
 Non-Windows: this app is Windows-only (global-hotkey + overlay implementation). On macOS/Linux, tell the user and stop.
 
+Exe vs source: there is also a packaged one-click build (`ParakeetDictation.exe`, shipped as `ParakeetDictation-win64.zip` on the GitHub Releases page) for non-technical humans who have no Python. As an agent, prefer the from-source route below: it is what this runbook documents, it is easier to verify and customize, and the fix table maps to source. Only point a user at the exe if they explicitly do not want Python. Both routes share one model cache and the single-instance lock (127.0.0.1:49731), so only one copy ever runs regardless of which was launched.
+
 ## 1. Preconditions
 
 1. Windows 10/11.
