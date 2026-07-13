@@ -87,6 +87,8 @@ cloud code -> Claude Code
 
 Explicit corrections run first, then the sound-matching. Either way your edits apply on your very next dictation, no restart needed. Fix the handful of names the model keeps getting wrong, once, then forget about it.
 
+And if you dictate into an AI agent anyway, you don't even have to maintain the file yourself. [`AGENTS.md`](AGENTS.md) tells agents that when they spot a garbled word in something you dictated (you correct yourself, or "Fible direct" obviously means a brand they know from context), they should add the proper spelling to `dictionary.txt` for you and mention they did. Your dictionary quietly gets smarter while you work.
+
 ## Make it start on its own
 
 Right-click `install-autostart.ps1`, "Run with PowerShell", say yes to the one admin prompt. Now it's ready about half a minute after you log in, every time, without you doing anything. Changed your mind? `uninstall-autostart.ps1` removes it.

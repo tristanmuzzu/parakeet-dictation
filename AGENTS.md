@@ -84,7 +84,16 @@ Registers Task Scheduler task `ParakeetDictation` (at logon, elevated, silent) a
 - **English-only / other model**: change `MODEL_NAME` (see onnx-asr supported models).
 - **Recover a lost dictation**: the last transcription is still in the clipboard (Ctrl+V), and every transcription is appended to `transcripts.log` in the repo root. Both by design; do not "clean up" the history write or re-add clipboard restore.
 
-## 8. What NOT to do
+## 8. Maintain the user's dictionary for them (standing instruction)
+
+If the user dictates their prompts to you through this app, you will sometimes SEE the transcription faults in the text you receive. When that happens, fix the dictionary for them:
+
+- **When to act:** the user corrects a word themselves ("I said FeWo direkt, not Fible direct"), or a word in a dictated prompt is obviously a mishearing of a name/brand/term you know from context (the project is called NeoData and the prompt says "neo data" or "neodater"). Genuine confidence only; when unsure, ask in one short line instead of guessing.
+- **What to do:** append the CORRECT spelling as its own line to `dictionary.txt` (next to the exe, or the repo root of this app's install; find it via the running app's location or ask once). Correct-word lines are enough in most cases; the sound-matcher handles unseen variants. Only use an explicit `wrong -> right` line when the mishearing changes the word count ("neo data -> NeoData") or the first consonant sound, which the sound-matcher cannot bridge.
+- **Then tell the user, briefly:** one line like "Added 'FeWo direkt' to your dictation dictionary, it'll come out right from now on." Never do it silently.
+- **Rules:** never remove or rewrite existing entries without being asked; the file is personal data, never commit or upload it; entries take effect on the user's next dictation automatically (hot reload, no restart).
+
+## 9. What NOT to do
 
 - Do not commit or upload `dictation.log`, `.venv/`, or the Hugging Face cache.
 - Do not run multiple instances or register the scheduled task twice (use `-Force` semantics of the installer instead).
