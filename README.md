@@ -63,6 +63,30 @@ Talk in whatever language you like, even switching mid-sentence. It cleans up th
 
 Two small safety nets, because losing a long dictation hurts: the transcription stays in your clipboard after it's typed, so if you clicked into the wrong window you can just Ctrl+V it where it belonged. And every transcription is also appended to `transcripts.log` next to the app (plain text, stays on your machine, never uploaded), so nothing you say is ever truly lost.
 
+## Teach it your words
+
+Every speech model mangles the odd name or brand it was never trained on, and the annoying part is it mangles the same word a different way every time. So there's a plain-text file, `dictionary.txt`, sitting next to the app (right beside the exe, or in the repo root if you run from source). It's created for you on the first run, already filled with examples and a note on the format. You open it, add a line, save. That's the whole thing.
+
+You just write the word the way it's actually spelled, one per line:
+
+```
+FeWo direkt
+Zeticle
+NeoData
+```
+
+That's it. From then on, anything you say that sounds like one of those gets fixed to the exact spelling you wrote, even spellings you never listed. "Fivo direct", "Fiwo direkt", "fave direkt" all quietly become "FeWo direkt". You never sit there guessing at every wrong version it might produce, which was the whole problem.
+
+It only does this for words of four letters or more (short words sound like too many other things to be safe), and it matches on how a word sounds, not its exact letters.
+
+For the rare word that comes out so mangled the sound-matching can't reach it, there's an escape hatch: an explicit correction with an arrow, wrong on the left, right on the right, alternatives split with `|`.
+
+```
+cloud code -> Claude Code
+```
+
+Explicit corrections run first, then the sound-matching. Either way your edits apply on your very next dictation, no restart needed. Fix the handful of names the model keeps getting wrong, once, then forget about it.
+
 ## Make it start on its own
 
 Right-click `install-autostart.ps1`, "Run with PowerShell", say yes to the one admin prompt. Now it's ready about half a minute after you log in, every time, without you doing anything. Changed your mind? `uninstall-autostart.ps1` removes it.

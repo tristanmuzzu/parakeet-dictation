@@ -80,6 +80,7 @@ Registers Task Scheduler task `ParakeetDictation` (at logon, elevated, silent) a
 
 - **Different hotkey**: edit the combo logic in `on_key()` in `dictation.py` (track the desired key names in `keys_down`). Keep the raw-hook pattern.
 - **Disable filler cleanup** (keep "um"s): set `CLEANUP = False` in `dictation.py`.
+- **Fix mangled names/brands**: edit `dictionary.txt` next to the app (created on first run, in the repo root from source). Primary syntax is one correct word/phrase per line (e.g. `FeWo direkt`); the app sound-matches and rewrites anything transcribed that sounds close, so wrong spellings are never enumerated. Only entries whose every word is 4+ letters are sound-matched. Advanced override: a `wrong -> right` line (with `|`-separated alternatives) still works and runs before the sound-matching. Case-insensitive, hot-reloads on save. It holds personal names, so it is gitignored; do not commit it.
 - **English-only / other model**: change `MODEL_NAME` (see onnx-asr supported models).
 - **Recover a lost dictation**: the last transcription is still in the clipboard (Ctrl+V), and every transcription is appended to `transcripts.log` in the repo root. Both by design; do not "clean up" the history write or re-add clipboard restore.
 
