@@ -47,13 +47,16 @@ log = logging.getLogger("dictation")
 SAMPLE_RATE = 16000
 MODEL_NAME = "nemo-parakeet-tdt-0.6b-v3"
 MIN_SECONDS = 0.3  # ignore taps shorter than this
-# Hotkeys (Ctrl+Win toggle, Esc cancel, Ctrl+Alt+Q quit) are implemented via a
-# raw keyboard hook in main() — see on_key() and the comment there for why
-# add_hotkey() string combos are NOT used.
+# Hotkeys (Ctrl+Win toggle, Ctrl+Shift+Win continuous mode, Esc cancel,
+# Ctrl+Alt+Q quit) are implemented via a raw keyboard hook in main() — see
+# on_key() and the comment there for why add_hotkey() string combos are NOT used.
 CLEANUP = True     # strip filler words (um/uh/...) and tidy spacing
 
-# Command keywords detected at the end of transcribed speech. "send" (or common
-# ASR mishearings like "sent") presses Enter after pasting; bare number words type
+# Command keywords detected at the end of transcribed speech, ONLY while
+# continuous mode is on: a one-shot dictation legitimately ends in "sent" or
+# "one" all the time, and stripping that word (plus firing a phantom Enter into
+# the focused window) would corrupt normal dictations. "send" (or common ASR
+# mishearings like "sent") presses Enter after pasting; bare number words type
 # that digit. Commands are stripped from the pasted text.
 _SEND_RX = re.compile(r"\b(send|sent|sand|sendt|sends|enter)\b[,.]?$", re.IGNORECASE)
 _NUM_RX = re.compile(r"\b(one|two|three|four|five|six|seven|eight|nine)\b[,.]?$", re.IGNORECASE)
@@ -600,9 +603,13 @@ class AsrSession:
         self.conn = conn
         self.lock = lock
         cm = state.get("continuous", False)
+        # Continuous mode cuts far more eagerly so inline commands ("send")
+        # complete within a beat of being spoken. max_seg must stay generous
+        # though: a hard cut lands mid-word and the space-join then splits
+        # that word in two, so it may only guard against truly nonstop speech.
         self.segmenter = Segmenter(
             min_seg=0.3 if cm else MIN_SEG,
-            max_seg=3.0 if cm else MAX_SEG,
+            max_seg=10.0 if cm else MAX_SEG,
             silence_cut=0.35 if cm else SILENCE_CUT,
             keep_sil=0.1 if cm else KEEP_SIL,
         )
@@ -610,7 +617,6 @@ class AsrSession:
         self.results = {}          # index -> transcribed text
         self.cancelled = False
         self._cmd_action = None    # set by feeder when a command is detected inline
-        self._cmd_text = None
         self._submitted = 0
         self._feeding = True
         self._cursor = 0           # how far into `frames` the feeder has read
@@ -664,11 +670,8 @@ class AsrSession:
         if cmd:
             log.info("inline command detected: %s (text: %r)", cmd, test_text)
             self._cmd_action = cmd
-            self._cmd_text = test_text
             self._feeding = False
             ui_q.put(("inline_cmd",))
-        elif len(joined) > 2:
-            log.info("inline check (no cmd): %r", joined[-60:])
 
     def _drain_frames(self):
         with frames_lock:
@@ -831,7 +834,12 @@ def stop_and_transcribe():
             # the log alone (local file, same privacy as transcripts.log).
             log.info("raw ASR text: %r", joined)
             joined = apply_dictionary(joined)
-            joined, cmd = detect_and_strip_command(joined)
+            # Command words are a continuous-mode feature only — see the note
+            # at _SEND_RX for why they must never fire on one-shot dictations.
+            if state["continuous"]:
+                joined, cmd = detect_and_strip_command(joined)
+            else:
+                cmd = None
             if cmd:
                 log.info("command detected: %s", cmd)
             # clean_text runs ONCE on the joined text, so filler/dup collapsing
@@ -843,9 +851,7 @@ def stop_and_transcribe():
                 save_transcript(out)
                 paste_text(out)
             if cmd:
-                time.sleep(0.05)
-                import keyboard
-                keyboard.send(cmd)
+                press_command_key(cmd)
             log.info("stop-to-paste: %.1fs (%d segments, %d chars)",
                      time.time() - t_stop, n_segments, len(out))
         except Exception as e:
@@ -886,6 +892,16 @@ def paste_text(text):
     # went to the wrong window (or nowhere), Ctrl+V drops it anywhere you like.
 
 
+def press_command_key(cmd):
+    """Fire a command keystroke ("enter" or a digit) after paste_text. The wait
+    gives the target app time to process the Ctrl+V first — slow apps would
+    otherwise see the Enter land before the pasted text."""
+    import keyboard
+
+    time.sleep(0.15)
+    keyboard.send(cmd)
+
+
 def toggle():
     log.info("hotkey fired: recording=%s busy=%s model_ready=%s",
              state["recording"], state["busy"], state["model_ready"])
@@ -913,6 +929,15 @@ def toggle_continuous():
         log.info("continuous mode on")
         if not state["recording"] and not state["busy"] and state["model_ready"]:
             start_recording()
+
+
+def restart_if_continuous():
+    """Continuous-mode re-arm, fired 400ms after a dictation finishes. The
+    delay is a window in which the user may have toggled continuous mode OFF —
+    re-check at fire time, or the mic would silently reopen after they said
+    stop. start_recording() itself guards recording/busy."""
+    if state["continuous"] and state["model_ready"]:
+        start_recording()
 
 
 def detect_and_strip_command(text):
@@ -955,6 +980,12 @@ def handle_inline_command():
             log.info("inline raw ASR: %r", joined)
             joined = apply_dictionary(joined)
             joined, cmd = detect_and_strip_command(joined)
+            if cmd is None:
+                # The feeder heard the command, but the flushed tail added
+                # words after it, so the end-anchored re-check missed. The
+                # mode already committed (mic is stopped) — honor what the
+                # feeder detected rather than leave the action half-fired.
+                cmd = sess._cmd_action
             if cmd:
                 log.info("inline command: %s (text: %r)", cmd, joined)
             out = clean_text(joined) if CLEANUP else joined
@@ -962,9 +993,7 @@ def handle_inline_command():
                 save_transcript(out)
                 paste_text(out)
             if cmd:
-                time.sleep(0.05)
-                import keyboard
-                keyboard.send(cmd)
+                press_command_key(cmd)
         except Exception:
             log.exception("inline command handler failed")
         finally:
@@ -1132,7 +1161,7 @@ class Overlay:
                     self.hide()
                 elif kind == "restart":
                     self.hide()
-                    self.root.after(400, start_recording)
+                    self.root.after(400, restart_if_continuous)
                 elif kind == "inline_cmd":
                     handle_inline_command()
                 elif kind == "quit":
@@ -1206,7 +1235,8 @@ def main():
 
     threading.Thread(target=wait_ready, daemon=True).start()
 
-    # Manual Ctrl+Win detection via a raw hook (keyboard's add_hotkey chokes
+    # Manual Ctrl+Win / Ctrl+Shift+Win detection via a raw hook (keyboard's
+    # add_hotkey chokes
     # on modifier-only combos). Key NAMES are locale-dependent: on a German
     # keyboard Ctrl reports as "strg" and the Win key as "linke/rechte
     # windows", so we normalize by locale before matching. No suppression is
@@ -1214,7 +1244,20 @@ def main():
     # Ctrl. Esc (cancel) and Ctrl+Alt+Q (quit) are handled here too, because
     # add_hotkey's English key names also miss on non-English layouts.
     keys_down = set()
-    _last_hotkey = 0.0
+    # One fire per physical press: Windows auto-repeats held modifier keys, so
+    # without this latch a combo held a beat too long would toggle over and
+    # over. The fire itself is DELAYED 150ms because the keys of a chord never
+    # land in one fixed order — Ctrl→Win→Shift would otherwise match plain
+    # Ctrl+Win the instant Win goes down and start a one-shot recording the
+    # user never asked for. The delay gives a late Shift time to arrive before
+    # we decide which toggle was meant; 150ms is imperceptible on a hotkey.
+    combo = {"active": False, "shift_seen": False}
+
+    def fire_combo():
+        if combo["shift_seen"] or "shift" in keys_down:
+            toggle_continuous()
+        else:
+            toggle()
 
     def norm(name):
         n = (name or "").lower()
@@ -1231,7 +1274,6 @@ def main():
         return n
 
     def on_key(e):
-        nonlocal _last_hotkey
         k = norm(e.name)
         if e.event_type == "down":
             keys_down.add(k)
@@ -1242,20 +1284,17 @@ def main():
             if "ctrl" in keys_down and "alt" in keys_down and k == "q":
                 quit_app()
                 return
-            now = time.time()
-            if now - _last_hotkey < 0.25:
-                return
             if {"ctrl", "windows"} <= keys_down:
-                log.info("hotkey raw: keys_down=%s  shift_in=%s",
-                         sorted(keys_down), "shift" in keys_down)
-                if "shift" in keys_down:
-                    _last_hotkey = now
-                    toggle_continuous()
-                else:
-                    _last_hotkey = now
-                    toggle()
+                if not combo["active"]:
+                    combo["active"] = True
+                    combo["shift_seen"] = "shift" in keys_down
+                    threading.Timer(0.15, fire_combo).start()
+                elif k == "shift":
+                    combo["shift_seen"] = True
         else:
             keys_down.discard(k)
+            if k in ("ctrl", "windows"):
+                combo["active"] = False
 
     keyboard.hook(on_key)
     log.info("manual hotkey hooks installed (ctrl+win, ctrl+shift+win, locale-aware)")

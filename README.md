@@ -56,8 +56,11 @@ Both routes share the same model cache and only ever let one copy run at a time,
 |---|---|
 | **Ctrl + Win** | Starts listening. A small "Transcribing" pill shows up at the bottom of the screen. |
 | **Ctrl + Win** again | Stops, and types what you said into whatever window you're in. |
+| **Ctrl + Shift + Win** | Toggles continuous mode: it types what you said, then immediately starts listening again, until you toggle it off. Great for long back-and-forths with a coding agent. |
 | **Esc** | Throws away the current recording, types nothing. |
 | **Ctrl + Alt + Q** | Quits. |
+
+While continuous mode is on, a few spoken keywords become commands: end what you're saying with **"send"** (or "enter") and it presses Enter for you right after the text lands — your message goes straight off to the agent, hands never touching the keyboard. Say a bare number like **"three"** to type that digit, handy when an agent asks you to pick an option. Keywords only count at the very end of what you said, and they're only live in continuous mode, so normal dictation never eats a word.
 
 Talk in whatever language you like, even switching mid-sentence. It cleans up the obvious filler ("um", "uh", repeated words, stray spacing) on its own. That's plain text tidying, it does not reword what you said or run it through another AI.
 
