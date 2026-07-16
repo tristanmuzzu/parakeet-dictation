@@ -52,6 +52,16 @@ MIN_SECONDS = 0.3  # ignore taps shorter than this
 # add_hotkey() string combos are NOT used.
 CLEANUP = True     # strip filler words (um/uh/...) and tidy spacing
 
+# Command keywords detected at the end of transcribed speech. "send" (or common
+# ASR mishearings like "sent") presses Enter after pasting; bare number words type
+# that digit. Commands are stripped from the pasted text.
+_SEND_RX = re.compile(r"\b(send|sent|sand|sendt|sends|enter)\b[,.]?$", re.IGNORECASE)
+_NUM_RX = re.compile(r"\b(one|two|three|four|five|six|seven|eight|nine)\b[,.]?$", re.IGNORECASE)
+_NUMBER_MAP = {
+    "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+}
+
 # Incremental transcription tuning. The whole point of streaming is to move the
 # ASR cost off the critical path: we chop the take into speech segments while
 # the user is still talking and transcribe each in the background, so only the
@@ -395,8 +405,14 @@ def apply_dictionary(text):
 # ships the pieces to the worker lives entirely in AsrSession.
 # ----------------------------------------------------------------------------
 class Segmenter:
-    def __init__(self, sr=SAMPLE_RATE):
+    def __init__(self, sr=SAMPLE_RATE,
+                 min_seg=MIN_SEG, max_seg=MAX_SEG,
+                 silence_cut=SILENCE_CUT, keep_sil=KEEP_SIL):
         self.sr = sr
+        self.min_seg = min_seg
+        self.max_seg = max_seg
+        self.silence_cut = silence_cut
+        self.keep_sil = keep_sil
         self.frame_len = max(1, int(sr * FRAME_MS / 1000))
         self._pending = np.zeros(0, dtype="float32")   # samples < one full frame
         # Start at the absolute floor and let calibration + EMA refine it. The
@@ -472,18 +488,18 @@ class Segmenter:
         if not allow_emit:
             return None
         # Cut A: enough speech banked and a real pause has landed. Trim the pause.
-        if (self._speech_samples >= MIN_SEG * self.sr
-                and self._trailing_sil >= SILENCE_CUT * self.sr):
+        if (self._speech_samples >= self.min_seg * self.sr
+                and self._trailing_sil >= self.silence_cut * self.sr):
             return self._cut(trim=True)
         # Cut B: segment got too long with no pause — cut hard to bound latency.
-        if self._seg_len >= MAX_SEG * self.sr:
+        if self._seg_len >= self.max_seg * self.sr:
             return self._cut(trim=False)
         return None
 
     def _cut(self, trim):
         concat = np.concatenate(self._seg)
         if trim:
-            keep = int(KEEP_SIL * self.sr)
+            keep = int(self.keep_sil * self.sr)
             if self._trailing_sil > keep:
                 drop = self._trailing_sil - keep
                 concat = concat[:max(0, concat.size - drop)]
@@ -556,7 +572,7 @@ def asr_worker(conn):
 # Main process: hook + UI + mic. Everything below must stay cheap.
 # ----------------------------------------------------------------------------
 ui_q: "queue.Queue[tuple]" = queue.Queue()
-state = {"recording": False, "busy": False, "model_ready": False}
+state = {"recording": False, "busy": False, "model_ready": False, "continuous": False}
 frames: list = []
 frames_lock = threading.Lock()
 stream = None
@@ -583,10 +599,18 @@ class AsrSession:
     def __init__(self, conn, lock):
         self.conn = conn
         self.lock = lock
-        self.segmenter = Segmenter()
+        cm = state.get("continuous", False)
+        self.segmenter = Segmenter(
+            min_seg=0.3 if cm else MIN_SEG,
+            max_seg=3.0 if cm else MAX_SEG,
+            silence_cut=0.35 if cm else SILENCE_CUT,
+            keep_sil=0.1 if cm else KEEP_SIL,
+        )
         self.seg_q: "queue.Queue" = queue.Queue()
         self.results = {}          # index -> transcribed text
         self.cancelled = False
+        self._cmd_action = None    # set by feeder when a command is detected inline
+        self._cmd_text = None
         self._submitted = 0
         self._feeding = True
         self._cursor = 0           # how far into `frames` the feeder has read
@@ -625,7 +649,26 @@ class AsrSession:
         # callback, so the audio thread only ever appends and never blocks.
         while self._feeding:
             self._drain_frames()
+            self._check_inline_cmd()
             time.sleep(0.05)
+
+    def _check_inline_cmd(self):
+        if not state.get("continuous"):
+            return
+        texts = [self.results.get(i)
+                 for i in range(self._submitted) if self.results.get(i)]
+        if not texts:
+            return
+        joined = " ".join(t for t in texts if t).strip()
+        test_text, cmd = detect_and_strip_command(joined)
+        if cmd:
+            log.info("inline command detected: %s (text: %r)", cmd, test_text)
+            self._cmd_action = cmd
+            self._cmd_text = test_text
+            self._feeding = False
+            ui_q.put(("inline_cmd",))
+        elif len(joined) > 2:
+            log.info("inline check (no cmd): %r", joined[-60:])
 
     def _drain_frames(self):
         with frames_lock:
@@ -719,7 +762,7 @@ def start_recording():
         return
     state["recording"] = True
     log.info("recording started")
-    ui_q.put(("show",))
+    ui_q.put(("listen",) if state["continuous"] else ("show",))
 
 
 def stop_and_transcribe():
@@ -748,7 +791,10 @@ def stop_and_transcribe():
             session.cancel()
             session.close()
             session = None
-        ui_q.put(("hide",))
+        if state["continuous"]:
+            ui_q.put(("restart",))
+        else:
+            ui_q.put(("hide",))
         return
     state["busy"] = True
     ui_q.put(("processing",))
@@ -785,6 +831,9 @@ def stop_and_transcribe():
             # the log alone (local file, same privacy as transcripts.log).
             log.info("raw ASR text: %r", joined)
             joined = apply_dictionary(joined)
+            joined, cmd = detect_and_strip_command(joined)
+            if cmd:
+                log.info("command detected: %s", cmd)
             # clean_text runs ONCE on the joined text, so filler/dup collapsing
             # works across segment boundaries just like the single-shot path did.
             out = clean_text(joined) if CLEANUP else joined
@@ -793,6 +842,10 @@ def stop_and_transcribe():
             if out:
                 save_transcript(out)
                 paste_text(out)
+            if cmd:
+                time.sleep(0.05)
+                import keyboard
+                keyboard.send(cmd)
             log.info("stop-to-paste: %.1fs (%d segments, %d chars)",
                      time.time() - t_stop, n_segments, len(out))
         except Exception as e:
@@ -802,7 +855,10 @@ def stop_and_transcribe():
         finally:
             state["busy"] = False
             session = None
-            ui_q.put(("hide",))
+            if state["continuous"]:
+                ui_q.put(("restart",))
+            else:
+                ui_q.put(("hide",))
 
     threading.Thread(target=work, daemon=True).start()
 
@@ -845,6 +901,83 @@ def toggle():
         start_recording()
 
 
+def toggle_continuous():
+    global session
+    if state["continuous"]:
+        state["continuous"] = False
+        if state["recording"]:
+            stop_and_transcribe()
+        log.info("continuous mode off")
+    else:
+        state["continuous"] = True
+        log.info("continuous mode on")
+        if not state["recording"] and not state["busy"] and state["model_ready"]:
+            start_recording()
+
+
+def detect_and_strip_command(text):
+    m = _NUM_RX.search(text)
+    if m:
+        word = m.group(1).lower()
+        return text[:m.start()].rstrip(), _NUMBER_MAP[word]
+    m = _SEND_RX.search(text)
+    if m:
+        return text[:m.start()].rstrip(), "enter"
+    return text, None
+
+
+def handle_inline_command():
+    global stream, session
+    if not state["recording"] or session is None:
+        return
+    sess = session
+    state["recording"] = False
+    try:
+        stream.stop()
+        stream.close()
+    except Exception:
+        pass
+    stream = None
+    state["busy"] = True
+    ui_q.put(("processing",))
+
+    def work():
+        global session
+        try:
+            sess.stop_feeding()
+            sess.close()
+            sess.join_consumer()
+            if sess.cancelled:
+                return
+            joined = " ".join(sess.ordered_texts()).strip()
+            if not joined:
+                return
+            log.info("inline raw ASR: %r", joined)
+            joined = apply_dictionary(joined)
+            joined, cmd = detect_and_strip_command(joined)
+            if cmd:
+                log.info("inline command: %s (text: %r)", cmd, joined)
+            out = clean_text(joined) if CLEANUP else joined
+            if out:
+                save_transcript(out)
+                paste_text(out)
+            if cmd:
+                time.sleep(0.05)
+                import keyboard
+                keyboard.send(cmd)
+        except Exception:
+            log.exception("inline command handler failed")
+        finally:
+            state["busy"] = False
+            session = None
+            if state["continuous"]:
+                ui_q.put(("restart",))
+            else:
+                ui_q.put(("hide",))
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 def cancel():
     global stream, session
     if state["recording"]:
@@ -862,7 +995,10 @@ def cancel():
             session.close()
             session = None
         log.info("recording cancelled")
-        ui_q.put(("hide",))
+        if state["continuous"]:
+            ui_q.put(("restart",))
+        else:
+            ui_q.put(("hide",))
 
 
 def quit_app():
@@ -984,6 +1120,8 @@ class Overlay:
                 kind = msg[0]
                 if kind == "show":
                     self.show_pill("Transcribing", "#ff5b6a", "recording")
+                elif kind == "listen":
+                    self.show_pill("Listening", "#ff5b6a", "recording")
                 elif kind == "processing":
                     self.show_pill("Transcribing", "#f5b23e", "processing")
                 elif kind == "loading":
@@ -992,6 +1130,11 @@ class Overlay:
                     self.show_pill(msg[1], "#f5b23e", "status")
                 elif kind == "hide":
                     self.hide()
+                elif kind == "restart":
+                    self.hide()
+                    self.root.after(400, start_recording)
+                elif kind == "inline_cmd":
+                    handle_inline_command()
                 elif kind == "quit":
                     self.root.destroy()
                     return
@@ -1071,7 +1214,7 @@ def main():
     # Ctrl. Esc (cancel) and Ctrl+Alt+Q (quit) are handled here too, because
     # add_hotkey's English key names also miss on non-English layouts.
     keys_down = set()
-    combo = {"active": False}
+    _last_hotkey = 0.0
 
     def norm(name):
         n = (name or "").lower()
@@ -1081,11 +1224,14 @@ def main():
             return "ctrl"
         if n in ("alt", "linke alt", "left alt", "rechte alt", "right alt"):
             return "alt"
+        if "shift" in n:
+            return "shift"
         if n in ("esc", "escape"):
             return "esc"
         return n
 
     def on_key(e):
+        nonlocal _last_hotkey
         k = norm(e.name)
         if e.event_type == "down":
             keys_down.add(k)
@@ -1096,16 +1242,23 @@ def main():
             if "ctrl" in keys_down and "alt" in keys_down and k == "q":
                 quit_app()
                 return
-            if {"ctrl", "windows"} <= keys_down and not combo["active"]:
-                combo["active"] = True
-                toggle()
+            now = time.time()
+            if now - _last_hotkey < 0.25:
+                return
+            if {"ctrl", "windows"} <= keys_down:
+                log.info("hotkey raw: keys_down=%s  shift_in=%s",
+                         sorted(keys_down), "shift" in keys_down)
+                if "shift" in keys_down:
+                    _last_hotkey = now
+                    toggle_continuous()
+                else:
+                    _last_hotkey = now
+                    toggle()
         else:
             keys_down.discard(k)
-            if k in ("ctrl", "windows"):
-                combo["active"] = False
 
     keyboard.hook(on_key)
-    log.info("manual ctrl+win hook installed (locale-aware)")
+    log.info("manual hotkey hooks installed (ctrl+win, ctrl+shift+win, locale-aware)")
     log.info("entering mainloop")
     root.mainloop()
     try:
