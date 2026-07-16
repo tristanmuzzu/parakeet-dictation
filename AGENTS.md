@@ -1,6 +1,6 @@
 # Agent runbook: set up Parakeet Dictation for the user
 
-You are setting up free, unlimited voice dictation on the user's **Windows** machine, built mainly for talking to AI coding agents (Cursor, Claude Code, ChatGPT and the like) without paying for a tool like Wispr Flow. Everything runs locally; the only download is the speech model from Hugging Face on first run. Target result: the user presses **Ctrl+Win**, speaks, presses **Ctrl+Win** again, and the recognized text is typed into the focused window.
+You are setting up free, unlimited voice dictation on the user's **Windows** machine, built mainly for talking to AI coding agents (Cursor, Claude Code, ChatGPT and the like) without paying for a tool like Wispr Flow. Everything runs locally; the only download is the speech model from Hugging Face on first run. Target result: the user presses **Ctrl+Win**, speaks, presses **Ctrl+Win** again, and the recognized text is typed into the focused window. There is also a hands-free continuous mode on **Ctrl+Shift+Win**: it re-arms the mic after every dictation, and (only in that mode) ending speech with "send"/"enter" presses Enter after the paste and a bare spoken digit word types that digit.
 
 Non-Windows: this app is Windows-only (global-hotkey + overlay implementation). On macOS/Linux, tell the user and stop.
 
