@@ -88,6 +88,38 @@ None of this involves an LLM, which is deliberate. Every rule here is either con
 
 Line breaks are only added in normal dictation. Continuous mode keeps everything on one line, since it presses Enter for you and a stray newline would send half a message. Want the whole thing off? Set `FORMAT = False` in `dictation.py`.
 
+To see exactly what it does without dictating anything (no mic, no model, instant):
+
+```powershell
+.\.venv\Scripts\python.exe tools\formatcheck.py
+```
+
+It prints the same text before and after, and tells you whether formatting is live on your install. Pass your own sentence in quotes to try it on something real.
+
+## Updating
+
+The app runs from wherever you installed it, so pulling new code is not enough on its own — **the running copy has to be restarted**, and if you use auto-start it launched at logon and is still holding the old code in memory.
+
+**From source:**
+
+```powershell
+git pull
+Get-Process python*,pythonw* | Stop-Process -Force      # or Ctrl+Alt+Q
+Start-Process -FilePath ".\.venv\Scripts\pythonw.exe" -ArgumentList "dictation.py" -WorkingDirectory (Get-Location)
+```
+
+If auto-start is registered, `Restart-ScheduledTask -TaskName ParakeetDictation` does the stop-and-start for you.
+
+**Running the packaged exe?** `git pull` does nothing for you — the exe has the Python bundled inside it. Either grab the new `ParakeetDictation-win64.zip` from Releases and extract over your copy, or rebuild it yourself with `build-exe.ps1`.
+
+Either way, `dictation.log` records which text stages are active on every launch:
+
+```
+text pipeline: cleanup=True format=True (para_gap=0.70s)
+```
+
+No such line means you're still on the old build.
+
 Two small safety nets, because losing a long dictation hurts: the transcription stays in your clipboard after it's typed, so if you clicked into the wrong window you can just Ctrl+V it where it belonged. And every transcription is also appended to `transcripts.log` next to the app (plain text, stays on your machine, never uploaded), so nothing you say is ever truly lost.
 
 ## Teach it your words

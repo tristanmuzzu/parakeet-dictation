@@ -1453,6 +1453,11 @@ def main():
     import keyboard
 
     log.info("=== app starting (pid=%s) ===", os.getpid())
+    # Which text stages are live, logged every launch. An updated checkout that
+    # was never restarted looks exactly like a broken feature from the outside;
+    # this line is what tells the two apart without guessing.
+    log.info("text pipeline: cleanup=%s format=%s (para_gap=%.2fs)",
+             CLEANUP, FORMAT, PARA_GAP)
     if not acquire_single_instance():
         log.info("another instance already running - exiting")
         return

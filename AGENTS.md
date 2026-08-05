@@ -75,6 +75,7 @@ Registers Task Scheduler task `ParakeetDictation` (at logon, elevated, silent) a
 | int8 download fails midway | Interrupted Hugging Face snapshot; loader then errors with "incomplete snapshot" | Re-run `selftest.py` with network; or delete `%USERPROFILE%\.cache\huggingface\hub\models--istupakov--parakeet-tdt-0.6b-v3-onnx` and retry. |
 | Model load very slow (~90 s) | fp32 fallback active | Confirm int8 weights downloaded (`encoder-model.int8.onnx` in the HF cache); rerun selftest with network. |
 | Text pastes but clipboard lost | Should not happen (old clipboard is restored), but clipboard managers can interfere | Note it to the user; harmless. |
+| User pulled new code but behaviour is unchanged | **The old process is still running.** Auto-start launches at logon and holds the previous code in memory; a `git pull` does not touch it. Source edits also never reach a packaged `ParakeetDictation.exe`, which bundles its own Python. | Check `dictation.log` for the `text pipeline: cleanup=... format=...` line written on every launch — absent or stale means old code. Restart: `Restart-ScheduledTask -TaskName ParakeetDictation`, or kill `pythonw` and relaunch. For the exe, rebuild via `build-exe.ps1` or install the new release zip. Verify text-stage changes with no mic via `tools/formatcheck.py`. |
 
 ## 7. Customization the user may ask for
 
