@@ -90,18 +90,251 @@ _FILLER = re.compile(
 
 
 def clean_text(t):
-    """Cheap, instant tidy-up of raw ASR text (no LLM)."""
+    """Cheap, instant tidy-up of raw ASR text (no LLM).
+
+    Whitespace handling is newline-AWARE on purpose: format_text and the
+    paragraph joiner put real line breaks into the text, and this runs after
+    them. Horizontal space is collapsed, vertical structure is preserved. With
+    no newlines present the result is byte-identical to the old behaviour.
+    """
     if not t:
         return t
     t = _FILLER.sub(" ", t)
     # collapse immediate duplicate words: "the the cat" -> "the cat"
-    t = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", t, flags=re.IGNORECASE)
-    t = re.sub(r"\s+([,.!?;:])", r"\1", t)   # no space before punctuation
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    t = re.sub(r"^[\s,.;:]+", "", t)         # no leading punctuation/space
+    t = re.sub(r"\b(\w+)([ \t]+\1\b)+", r"\1", t, flags=re.IGNORECASE)
+    t = re.sub(r"[ \t]+([,.!?;:])", r"\1", t)   # no space before punctuation
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"[ \t]*\n[ \t]*", "\n", t)      # no stray space around breaks
+    t = re.sub(r"\n{3,}", "\n\n", t)            # at most one blank line
+    t = t.strip()
+    t = re.sub(r"^[\s,.;:]+", "", t)            # no leading punctuation/space
     if t:
         t = t[0].upper() + t[1:]
     return t
+
+
+# ----------------------------------------------------------------------------
+# Structural formatting: make a dictated wall of text readable.
+#
+# This is the "what Wispr Flow's LLM pass does" layer, done with rules instead
+# of a model. That is a deliberate trade, not a shortcut. An LLM rewrite is
+# autoregressive — it has to emit every word again — so on a 4-core laptop CPU
+# it would cost several seconds per dictation AND fight the ASR worker for the
+# same cores, which is exactly the latency this app's streaming design exists to
+# avoid. Rules are free, instant, and, crucially, CANNOT invent words you did
+# not say. Everything below is therefore biased hard towards doing nothing when
+# the evidence is weak: a missed list is a shrug, a corrupted dictation is not.
+#
+# Three things happen here, in order:
+#   1. Sentence capitalization  — Parakeet punctuates but often leaves the next
+#      word lowercase ("...today. because Parakeet is free").
+#   2. Spoken quotes            — "quote X unquote" becomes "X".
+#   3. Enumerations             — "first off ... secondly ... lastly ..."
+#      becomes a real numbered list.
+# Paragraph breaks come from a different source entirely (how long you paused)
+# and are applied earlier, in join_segments().
+# ----------------------------------------------------------------------------
+FORMAT = True            # structural formatting (lists, quotes, paragraphs)
+PARA_GAP = 0.7           # leading silence (s) on a segment that starts a new para
+
+# Words that legitimately end in a period mid-sentence, so the next word must
+# NOT be capitalized. Single letters ("J. Smith", "e.g.") are handled by rule.
+_ABBREV = frozenset("""
+e.g i.e etc vs approx no nos fig cf al st jr sr inc ltd co dept vol
+dr mr mrs ms prof gen sgt lt capt rev hon
+z.b bzw usw ca u.a d.h evtl ggf inkl bzgl
+""".split())
+
+_SENT_BREAK = re.compile(r"([.!?])([ \t]+|\n+)([^\W\d_])", re.UNICODE)
+
+# "quote ... unquote". Both delimiters are required, which is what makes this
+# safe: a bare "quote" in ordinary speech never triggers it.
+_QUOTE_RX = re.compile(
+    r"\bquote\b[,:]?\s+(.+?)\s*,?\s*\b(?:unquote|end\s+quote|end\s+of\s+quote|"
+    r"close\s+quote)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Spoken enumeration markers -> the ordinal they claim. 0 is the "last item"
+# sentinel ("lastly", "finally"), which is only accepted in final position.
+_ORDINALS = [
+    ("first off", 1), ("first of all", 1), ("for starters", 1),
+    ("to start with", 1), ("number one", 1), ("firstly", 1), ("first", 1),
+    ("second off", 2), ("second of all", 2), ("number two", 2),
+    ("secondly", 2), ("second", 2),
+    ("third off", 3), ("third of all", 3), ("number three", 3),
+    ("thirdly", 3), ("third", 3),
+    ("fourth off", 4), ("number four", 4), ("fourthly", 4), ("fourth", 4),
+    ("number five", 5), ("fifthly", 5), ("fifth", 5),
+    ("number six", 6), ("sixthly", 6), ("sixth", 6),
+    ("number seven", 7), ("seventh", 7),
+    ("last but not least", 0), ("lastly", 0), ("finally", 0),
+]
+# Longest phrase first, so "first of all" wins over "first".
+_ORDINAL_MAP = {p: n for p, n in _ORDINALS}
+_ORDINAL_RX = re.compile(
+    r"\b(" + "|".join(re.escape(p).replace(r"\ ", r"\s+")
+                      for p, _ in sorted(_ORDINALS, key=lambda x: -len(x[0])))
+    + r")\b[,:]?\s+",
+    re.IGNORECASE,
+)
+
+MIN_LIST_ITEM_WORDS = 3   # below this it is counting, not enumerating
+MAX_QUOTE_CHARS = 200     # longer than this and the two markers are unrelated
+
+
+def _quote_sub(m):
+    """Turn a spoken quote into a real one, unless the span is implausibly long
+    — that means a stray "quote" and a stray "unquote" happened to bracket half
+    the dictation, not that the user quoted half the dictation."""
+    inner = m.group(1).strip()
+    if not inner or len(inner) > MAX_QUOTE_CHARS:
+        return m.group(0)
+    return '"%s"' % inner
+
+
+def _is_abbreviation(t, dot_pos):
+    """True if the period at dot_pos closes an abbreviation or an initial."""
+    k = dot_pos
+    while k > 0 and (t[k - 1].isalpha() or t[k - 1] == "."):
+        k -= 1
+    word = t[k:dot_pos].lower().strip(".")
+    if not word:
+        return False
+    return word in _ABBREV or len(word) == 1
+
+
+def _capitalize_sentences(t):
+    """Uppercase the first letter after . ! ? — the single most common way
+    dictated text reads as broken. Abbreviations and initials are left alone."""
+    def rep(m):
+        punct, gap, ch = m.group(1), m.group(2), m.group(3)
+        if punct == "." and _is_abbreviation(t, m.start(1)):
+            return m.group(0)
+        return punct + gap + ch.upper()
+    return _SENT_BREAK.sub(rep, t)
+
+
+# A marker counts as starting a sentence even when a throwaway discourse word
+# runs in front of it — "So first off, ..." and "And secondly, ..." are how
+# people actually enumerate out loud. The lead-in is matched so it can be
+# dropped from the item text along with the marker itself.
+_SENT_LEAD = re.compile(
+    r"(?:^|[.!?\n])[ \t]*"
+    r"(?:(?:so|and|ok|okay|now|well|then|but|also|alright|right|anyway)"
+    r",?[ \t]+)?$",
+    re.IGNORECASE,
+)
+
+
+def _sentence_start_at(t, pos):
+    """If a marker at `pos` opens a sentence, return the index the item should
+    be cut from (in front of any lead-in word). Otherwise None."""
+    m = _SENT_LEAD.search(t[:pos])
+    if not m:
+        return None
+    start = m.start()
+    if start < pos and t[start] in ".!?\n":
+        start += 1          # the sentence end belongs to the previous item
+    return start
+
+
+def _find_enumeration(t):
+    """Return the list of (start, end, ordinal) enumeration markers that sit at
+    sentence starts, or None if this text is not a real enumeration.
+
+    The bar is deliberately high. It must start at "first", the ordinals must
+    strictly ascend, there must be at least two of them, and every item must
+    carry real content. "First, second, third" said while counting fails all of
+    these and is left exactly as spoken.
+    """
+    hits = []
+    for m in _ORDINAL_RX.finditer(t):
+        start = _sentence_start_at(t, m.start())
+        if start is None:
+            continue
+        phrase = re.sub(r"\s+", " ", m.group(1).lower())
+        hits.append((start, m.end(), _ORDINAL_MAP[phrase]))
+    if len(hits) < 2:
+        return None
+    if hits[0][2] != 1:                       # a list has to start at "first"
+        return None
+    # 0 ("lastly") is only meaningful as the final marker.
+    if any(n == 0 for _, _, n in hits[:-1]):
+        return None
+    numbered = [n for _, _, n in hits if n]
+    if numbered != sorted(set(numbered)) or len(numbered) != len(set(numbered)):
+        return None
+    # Every item needs enough words to be an item rather than a count.
+    for i, (_, end, _n) in enumerate(hits):
+        stop = hits[i + 1][0] if i + 1 < len(hits) else len(t)
+        if len(t[end:stop].split()) < MIN_LIST_ITEM_WORDS:
+            return None
+    return hits
+
+
+def _apply_enumeration(t):
+    hits = _find_enumeration(t)
+    if not hits:
+        return t
+    intro = t[:hits[0][0]].strip()
+    # A paragraph break after the final marker means the user finished the list
+    # and moved on, so everything past it is an outro rather than list item N.
+    tail_start = hits[-1][1]
+    outro = ""
+    split = t.find("\n\n", tail_start)
+    end_of_list = split if split != -1 else len(t)
+    if split != -1:
+        outro = t[split:].strip()
+    items = []
+    for i, (_, end, _n) in enumerate(hits):
+        stop = hits[i + 1][0] if i + 1 < len(hits) else end_of_list
+        # An item is one line: pauses inside it must not break the list.
+        item = re.sub(r"\s+", " ", t[end:stop]).strip().rstrip(",")
+        if item:
+            item = item[0].upper() + item[1:]
+        items.append(f"{i + 1}. {item}")
+    parts = [p for p in (intro, "\n".join(items), outro) if p]
+    return "\n\n".join(parts)
+
+
+def format_text(t, allow_breaks=True):
+    """Structural pass over already-cleaned text. `allow_breaks` gates every
+    rule that introduces a line break — continuous mode keeps text on one line,
+    because it presses Enter for you and a stray newline would fire it early."""
+    if not t:
+        return t
+    t = _capitalize_sentences(t)
+    t = _QUOTE_RX.sub(_quote_sub, t)
+    if allow_breaks:
+        t = _apply_enumeration(t)
+    return t
+
+
+def join_segments(texts, gaps, allow_breaks=True):
+    """Join streamed segments into one text, promoting long pauses to paragraph
+    breaks.
+
+    Two independent signals must agree before a break is inserted: the user
+    actually stopped talking for a beat (acoustic — `gaps` comes straight from
+    the segmenter), AND the previous segment ended on a finished sentence
+    (linguistic). Requiring both is what keeps a break from ever landing in the
+    middle of a sentence, which is the only way this rule could do damage.
+    """
+    out = ""
+    for i, piece in enumerate(texts):
+        piece = (piece or "").strip()
+        if not piece:
+            continue
+        if not out:
+            out = piece
+            continue
+        gap = gaps[i] if i < len(gaps) else 0.0
+        if allow_breaks and gap >= PARA_GAP and out.rstrip()[-1:] in ".!?":
+            out += "\n\n" + piece
+        else:
+            out += " " + piece
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -425,6 +658,13 @@ class Segmenter:
         self._calib_remaining = int(CALIB_SEC * sr)
         self._calib_sum = 0.0
         self._calib_count = 0
+        # Seconds of silence sitting in FRONT of each emitted segment's speech,
+        # in emission order. A cut fires the moment silence_cut is reached, so
+        # the pause length is never visible at the cut itself — the rest of the
+        # pause lands as leading silence on the NEXT segment. That is what makes
+        # this the honest measure of "how long did they stop for", and it is the
+        # signal paragraph breaks are built from. See lead_gaps consumers.
+        self.lead_gaps = []
         self._reset_segment()
 
     def _reset_segment(self):
@@ -432,6 +672,8 @@ class Segmenter:
         self._seg_len = 0         # total samples in the current segment
         self._speech_samples = 0  # samples classified as speech in it
         self._trailing_sil = 0    # consecutive silence samples at the very end
+        self._lead_sil = 0        # silence samples before this segment's speech
+        self._seen_speech = False # flips once the first speech frame lands
 
     def push(self, block):
         """Consume one audio block (1-D float32 @ sr). Returns a list of cut
@@ -467,8 +709,12 @@ class Segmenter:
         # tail simply carries sound above the absolute floor for long enough.
         rms = float(np.sqrt(np.mean(concat * concat))) if concat.size else 0.0
         loud_ok = concat.size >= MIN_SECONDS * self.sr and rms > ABS_FLOOR
+        lead = self._lead_sil / self.sr
         self._reset_segment()
-        return concat if (speech_ok or loud_ok) else None
+        if not (speech_ok or loud_ok):
+            return None
+        self.lead_gaps.append(lead)   # stays index-aligned with emission order
+        return concat
 
     def _step(self, frame, allow_emit):
         rms = float(np.sqrt(np.mean(frame * frame))) if frame.size else 0.0
@@ -484,8 +730,11 @@ class Segmenter:
         if rms > thresh:
             self._speech_samples += frame.size
             self._trailing_sil = 0
+            self._seen_speech = True
         else:
             self._trailing_sil += frame.size
+            if not self._seen_speech:
+                self._lead_sil += frame.size
             if self._calib_remaining <= 0:   # track the floor on true silence only
                 self._floor = (1 - EMA_ALPHA) * self._floor + EMA_ALPHA * rms
         if not allow_emit:
@@ -506,6 +755,7 @@ class Segmenter:
             if self._trailing_sil > keep:
                 drop = self._trailing_sil - keep
                 concat = concat[:max(0, concat.size - drop)]
+        self.lead_gaps.append(self._lead_sil / self.sr)
         self._reset_segment()
         return concat
 
@@ -649,6 +899,21 @@ class AsrSession:
     def ordered_texts(self):
         return [self.results[i] for i in range(self._submitted)
                 if self.results.get(i)]
+
+    def ordered_pairs(self):
+        """(text, leading-pause-seconds) per segment that produced text, in
+        submission order. The pause is how long the user was silent before that
+        segment's speech began — join_segments turns the long ones into
+        paragraph breaks. Segments that transcribed to nothing are dropped here,
+        so the gap has to be carried alongside the text rather than looked up by
+        index later."""
+        gaps = self.segmenter.lead_gaps
+        out = []
+        for i in range(self._submitted):
+            txt = self.results.get(i)
+            if txt:
+                out.append((txt, gaps[i] if i < len(gaps) else 0.0))
+        return out
 
     def _feed(self):
         # Poll the shared frames buffer rather than doing DSP in the mic
@@ -814,8 +1079,12 @@ def stop_and_transcribe():
             sess.join_consumer()
             if sess.cancelled:
                 return
-            texts = sess.ordered_texts()
-            if not texts:
+            # Structural breaks are a one-shot-dictation feature. Continuous
+            # mode presses Enter for you, and a newline reaching the target
+            # window ahead of that would submit half a message.
+            allow_breaks = FORMAT and not state["continuous"]
+            pairs = sess.ordered_pairs()
+            if not pairs:
                 # Nothing got segmented: fall back to exactly today's behaviour
                 # and transcribe the whole take once.
                 with worker_lock:
@@ -824,8 +1093,10 @@ def stop_and_transcribe():
                 joined = (payload or "").strip() if kind == "text" else ""
                 n_segments = 1
             else:
-                joined = " ".join(texts)
-                n_segments = len(texts)
+                joined = join_segments([t for t, _ in pairs],
+                                       [g for _, g in pairs],
+                                       allow_breaks=allow_breaks)
+                n_segments = len(pairs)
             # Personal dictionary fixes the model's known misfires (names,
             # brands) on the joined text BEFORE clean_text. Both the segmented
             # and the whole-take fallback path funnel through `joined`, so this
@@ -845,7 +1116,11 @@ def stop_and_transcribe():
             # clean_text runs ONCE on the joined text, so filler/dup collapsing
             # works across segment boundaries just like the single-shot path did.
             out = clean_text(joined) if CLEANUP else joined
-            log.info("ASR result: %d chars -> %d after cleanup",
+            # Structural pass last: it works on tidied text, and it is the only
+            # stage that may introduce line breaks.
+            if FORMAT:
+                out = format_text(out, allow_breaks=allow_breaks)
+            log.info("ASR result: %d chars -> %d after cleanup/format",
                      len(joined), len(out))
             if out:
                 save_transcript(out)

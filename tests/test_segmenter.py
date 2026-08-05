@@ -85,6 +85,50 @@ def test_pure_silence_no_segment():
     print("ok test_pure_silence_no_segment")
 
 
+def test_lead_gaps_measure_the_pause():
+    # Two utterances split by a long pause. The cut fires 0.6s into that pause,
+    # so the REST of it lands as leading silence on the second segment — that
+    # residue is what the paragraph-break rule reads.
+    rng = np.random.default_rng(6)
+    wav = np.concatenate([silence(0.4, rng), speech(3.2, rng),
+                          silence(2.0, rng), speech(3.2, rng),
+                          silence(0.8, rng), speech(1.0, rng)])
+    seg = Segmenter()
+    emitted = seg.push(wav)
+    assert len(emitted) == 2, f"expected 2 cuts, got {len(emitted)}"
+    assert len(seg.lead_gaps) == 2, "one gap recorded per emitted segment"
+    # Segment 2 follows a 2.0s pause, 0.6s of which triggered the cut.
+    assert seg.lead_gaps[1] > 0.7, f"gap {seg.lead_gaps[1]:.2f}s should be long"
+    print("ok test_lead_gaps_measure_the_pause")
+
+
+def test_lead_gaps_short_for_quick_pause():
+    # A pause barely long enough to cut leaves almost nothing on the next
+    # segment, so back-to-back sentences must NOT read as a paragraph break.
+    rng = np.random.default_rng(7)
+    wav = np.concatenate([silence(0.4, rng), speech(3.2, rng),
+                          silence(0.7, rng), speech(3.2, rng),
+                          silence(0.7, rng), speech(1.0, rng)])
+    seg = Segmenter()
+    emitted = seg.push(wav)
+    assert len(emitted) >= 2, "expected cuts on both pauses"
+    assert seg.lead_gaps[1] < 0.7, f"gap {seg.lead_gaps[1]:.2f}s should be short"
+    print("ok test_lead_gaps_short_for_quick_pause")
+
+
+def test_lead_gaps_align_with_segments():
+    rng = np.random.default_rng(8)
+    wav = np.concatenate([silence(0.4, rng), speech(3.2, rng),
+                          silence(1.5, rng), speech(3.2, rng)])
+    seg = Segmenter()
+    emitted = seg.push(wav)
+    tail = seg.finalize()
+    n = len(emitted) + (1 if tail is not None else 0)
+    assert len(seg.lead_gaps) == n, \
+        f"{len(seg.lead_gaps)} gaps for {n} segments — must stay index-aligned"
+    print("ok test_lead_gaps_align_with_segments")
+
+
 def test_determinism():
     def run(seed):
         rng = np.random.default_rng(seed)
@@ -112,5 +156,8 @@ if __name__ == "__main__":
     test_tail_finalize()
     test_no_cut_short_utterance()
     test_pure_silence_no_segment()
+    test_lead_gaps_measure_the_pause()
+    test_lead_gaps_short_for_quick_pause()
+    test_lead_gaps_align_with_segments()
     test_determinism()
     print("\nALL SEGMENTER TESTS PASSED")
