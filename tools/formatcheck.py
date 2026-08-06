@@ -45,10 +45,23 @@ def render(pairs):
 
 
 def main():
+    args = [a for a in sys.argv[1:] if a != "--quiet"]
+    quiet = "--quiet" in sys.argv
+
     if not hasattr(dictation, "format_text"):
         print("OLD BUILD: this install predates the formatting feature.")
+        print("Run update.ps1, or git pull, then restart the app.")
         return 1
 
+    if quiet:
+        # Called from update.ps1: just prove the rules fire on this install.
+        before, after = render(SAMPLE)
+        ok = before != after and "\n1. " in after
+        print(f"format_text present, FORMAT={dictation.FORMAT}, "
+              f"rules fire: {'yes' if ok else 'NO'}")
+        return 0 if ok else 1
+
+    sys.argv = [sys.argv[0]] + args
     if len(sys.argv) > 1:
         # One blob of text: no pause information, so paragraph breaks cannot
         # fire — only the text-level rules do.

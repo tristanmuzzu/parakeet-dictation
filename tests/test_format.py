@@ -139,6 +139,73 @@ def test_lead_in_word_before_marker():
     print("ok test_lead_in_word_before_marker")
 
 
+def test_real_speech_enumeration():
+    # Straight from a real dictation. Parakeet put a PERIOD after "first"
+    # (not a comma), "Secondly" opens a sentence, and "thirdly" is buried
+    # mid-clause after "and". All three have to be caught.
+    src = ("So I walked away and the thing they did was first. run towards "
+           "the big tree. Secondly, I headed home and thirdly I didn't do "
+           "anything else.")
+    got = format_text(src)
+    assert got == ("So I walked away and the thing they did was:\n\n"
+                   "1. Run towards the big tree.\n"
+                   "2. I headed home\n"
+                   "3. I didn't do anything else."), got
+    print("ok test_real_speech_enumeration")
+
+
+def test_strong_marker_mid_sentence():
+    # "secondly"/"thirdly" have no non-enumerating use, so they count anywhere.
+    src = ("First off, we check the log file. Then secondly we restart the "
+           "whole service properly.")
+    got = format_text(src)
+    assert got == ("1. We check the log file.\n"
+                   "2. We restart the whole service properly."), got
+    print("ok test_strong_marker_mid_sentence")
+
+
+def test_connective_stripped_from_item():
+    src = ("Firstly I read the config file and secondly I validate every "
+           "single entry.")
+    got = format_text(src)
+    assert got == ("1. I read the config file\n"
+                   "2. I validate every single entry."), got
+    print("ok test_connective_stripped_from_item")
+
+
+def test_intro_gets_a_colon():
+    src = ("Here is what we do first, read the config file. Second, validate "
+           "every entry.")
+    got = format_text(src)
+    assert got.startswith("Here is what we do:\n\n1. "), got
+    print("ok test_intro_gets_a_colon")
+
+
+def test_adjectival_ordinals_are_not_a_list():
+    # "the first thing" / "a second chance" are ordinary adjectives. Without
+    # punctuation after the ordinal there was no pause, so there is no list.
+    for src in [
+        "The first thing I noticed was the color of it. The second thing was "
+        "the smell of it.",
+        "For the first time in years I felt good. I got a second chance at "
+        "life here.",
+        "He came in first in the race and second in the long jump event.",
+        "Wait a second before you retry that. The first attempt already "
+        "failed once.",
+    ]:
+        assert _find_enumeration(src) is None, src
+        assert format_text(src) == src, format_text(src)
+    print("ok test_adjectival_ordinals_are_not_a_list")
+
+
+def test_finally_needs_a_pause():
+    # "I finally got it working" is adverbial, not a list item.
+    src = "First, I tried rebooting the machine. Then I finally got it working."
+    assert _find_enumeration(src) is None
+    assert format_text(src) == src, format_text(src)
+    print("ok test_finally_needs_a_pause")
+
+
 def test_single_marker_is_not_a_list():
     src = "First of all, I think we should just try it and see."
     assert format_text(src) == src, format_text(src)

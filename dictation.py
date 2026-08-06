@@ -175,9 +175,28 @@ _ORDINAL_MAP = {p: n for p, n in _ORDINALS}
 _ORDINAL_RX = re.compile(
     r"\b(" + "|".join(re.escape(p).replace(r"\ ", r"\s+")
                       for p, _ in sorted(_ORDINALS, key=lambda x: -len(x[0])))
-    + r")\b[,:]?\s+",
+    + r")\b([,.;:]?)\s+",
     re.IGNORECASE,
 )
+
+# STRONG markers have no meaning in English other than enumerating, so they
+# count wherever they appear — including buried mid-sentence, which is where
+# speech puts them ("...I headed home and thirdly I didn't...").
+#
+# WEAK markers are ordinary words that happen to double as list markers ("the
+# first time", "wait a second", "I finally got it working"). They only count
+# when the speaker actually paused on them — that is, when the transcript has
+# punctuation right after ("first," or "first.") — or when they open a sentence.
+# That single test cleanly separates the adverbial use that means "item one"
+# from the adjectival use that means "the initial one".
+_STRONG_ORDINALS = frozenset("""
+firstly secondly thirdly fourthly fifthly sixthly lastly
+""".split()) | {p for p, _ in _ORDINALS if " " in p}
+
+# Connectives users run straight into a marker. Dropped from the item text.
+_CONNECTIVES = frozenset(
+    "and so then but also now well right anyway ok okay alright".split())
+_TRAILING_WORD_RX = re.compile(r"(?:^|[\s,;:])([^\W\d_]+)$")
 
 MIN_LIST_ITEM_WORDS = 3   # below this it is counting, not enumerating
 MAX_QUOTE_CHARS = 200     # longer than this and the two markers are unrelated
@@ -227,6 +246,19 @@ _SENT_LEAD = re.compile(
 )
 
 
+def _item_cut_start(t, pos):
+    """Where the PREVIOUS item ends, given a marker starting at `pos`.
+
+    Backs up over a connective the speaker ran into the marker, so "I headed
+    home and thirdly ..." ends item two at "home" rather than at "home and".
+    """
+    head = t[:pos].rstrip()
+    m = _TRAILING_WORD_RX.search(head)
+    if m and m.group(1).lower() in _CONNECTIVES:
+        head = head[:m.start(1)].rstrip()
+    return len(head)
+
+
 def _sentence_start_at(t, pos):
     """If a marker at `pos` opens a sentence, return the index the item should
     be cut from (in front of any lead-in word). Otherwise None."""
@@ -250,11 +282,16 @@ def _find_enumeration(t):
     """
     hits = []
     for m in _ORDINAL_RX.finditer(t):
-        start = _sentence_start_at(t, m.start())
-        if start is None:
-            continue
         phrase = re.sub(r"\s+", " ", m.group(1).lower())
-        hits.append((start, m.end(), _ORDINAL_MAP[phrase]))
+        strong = phrase in _STRONG_ORDINALS
+        # Weak markers need the speaker to have paused on them (punctuation
+        # follows) or to have opened a sentence with them. Strong ones need
+        # neither — speech buries them mid-clause all the time.
+        if not (strong or m.group(2)
+                or _sentence_start_at(t, m.start()) is not None):
+            continue
+        hits.append((_item_cut_start(t, m.start()), m.end(),
+                     _ORDINAL_MAP[phrase]))
     if len(hits) < 2:
         return None
     if hits[0][2] != 1:                       # a list has to start at "first"
@@ -277,7 +314,11 @@ def _apply_enumeration(t):
     hits = _find_enumeration(t)
     if not hits:
         return t
-    intro = t[:hits[0][0]].strip()
+    intro = t[:hits[0][0]].strip().rstrip(",")
+    # A lead-in that runs straight into the list ("...the thing they did was")
+    # reads as truncated without something to hand off to the items.
+    if intro and intro[-1] not in ".!?:":
+        intro += ":"
     # A paragraph break after the final marker means the user finished the list
     # and moved on, so everything past it is an outro rather than list item N.
     tail_start = hits[-1][1]

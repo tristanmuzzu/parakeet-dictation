@@ -98,27 +98,23 @@ It prints the same text before and after, and tells you whether formatting is li
 
 ## Updating
 
-The app runs from wherever you installed it, so pulling new code is not enough on its own — **the running copy has to be restarted**, and if you use auto-start it launched at logon and is still holding the old code in memory.
+Right-click **`update.ps1`**, pick "Run with PowerShell". That's it.
 
-**From source:**
+It pulls the newest code, checks the new code is really there, restarts the app so the running copy actually picks it up, and prints what it found. Everything below is what it does for you, and why doing it by hand is easy to get wrong.
 
-```powershell
-git pull
-Get-Process python*,pythonw* | Stop-Process -Force      # or Ctrl+Alt+Q
-Start-Process -FilePath ".\.venv\Scripts\pythonw.exe" -ArgumentList "dictation.py" -WorkingDirectory (Get-Location)
-```
+**Pulling is not enough on its own.** The app auto-starts at logon and keeps the old code in memory until it's restarted, so `git pull` alone changes nothing you can see. `update.ps1` restarts it.
 
-If auto-start is registered, `Restart-ScheduledTask -TaskName ParakeetDictation` does the stop-and-start for you.
+**A packaged exe ignores source updates completely.** `ParakeetDictation.exe` has Python baked inside it, so `git pull` cannot touch it. Rebuild with `build-exe.ps1`, or download the newest zip from Releases. `update.ps1` warns you if it spots an exe next to it.
 
-**Running the packaged exe?** `git pull` does nothing for you — the exe has the Python bundled inside it. Either grab the new `ParakeetDictation-win64.zip` from Releases and extract over your copy, or rebuild it yourself with `build-exe.ps1`.
+**Auto-start might point at a different folder than the one you're updating.** If you once extracted the release zip somewhere and later cloned the repo elsewhere, you'd be updating a copy you never run — and everything would look broken for no visible reason. `update.ps1` compares the two paths and tells you.
 
-Either way, `dictation.log` records which text stages are active on every launch:
+To check by hand, `dictation.log` records the active text stages on every launch:
 
 ```
 text pipeline: cleanup=True format=True (para_gap=0.70s)
 ```
 
-No such line means you're still on the old build.
+No such line means you're still on the old build. And `tools\formatcheck.py` shows you before/after with no mic and no model, so you can confirm the rules work without dictating anything.
 
 Two small safety nets, because losing a long dictation hurts: the transcription stays in your clipboard after it's typed, so if you clicked into the wrong window you can just Ctrl+V it where it belonged. And every transcription is also appended to `transcripts.log` next to the app (plain text, stays on your machine, never uploaded), so nothing you say is ever truly lost.
 
