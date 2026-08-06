@@ -64,60 +64,6 @@ While continuous mode is on, a few spoken keywords become commands: end what you
 
 Talk in whatever language you like, even switching mid-sentence. It cleans up the obvious filler ("um", "uh", repeated words, stray spacing) on its own. That's plain text tidying, it does not reword what you said or run it through another AI.
 
-## It formats what you said
-
-A minute of talking comes out as a wall of text, and walls of text are miserable to re-read (and slower for an AI agent to work through). So it does a bit of structuring on the way out. Four things:
-
-**Sentences get capitalized.** Parakeet punctuates well but often leaves the next word lowercase, so you get "…or rather today. because Parakeet is free". That now reads properly. Abbreviations ("e.g."), initials ("J. Smith") and decimals ("3.5") are left alone.
-
-**Spoken lists become real lists.** Say "first off… secondly… lastly…" and you get:
-
-```
-1. …
-2. …
-3. …
-```
-
-It only does this when it's genuinely a list: the run has to *start* at "first", the numbers have to climb in order, and each item needs real content. Counting out loud ("first, second, third") stays as words. One lone "first of all" stays as words too. Says "so first off" or "and secondly"? Still works, the lead-in gets dropped.
-
-**Spoken quotes become quotes.** "He said quote this is fine unquote" comes out as `He said "this is fine"`. Both halves are required, so just using the word "quote" in a sentence never triggers it.
-
-**Pauses become paragraphs.** This is the one that helps most, and it works because the app already knows something no text-cleanup tool does: it's listening to you, so it knows *exactly where you stopped to think*. Take a breath after finishing a thought and you get a paragraph break there. It needs two things to agree before it breaks — you actually paused, **and** the sentence before it was finished — so a break can never land mid-sentence.
-
-None of this involves an LLM, which is deliberate. Every rule here is either confident or does nothing, so it can't invent words you didn't say, it costs zero milliseconds, and there's nothing extra to download. It cannot fix a genuinely misheard word, though — that's what `dictionary.txt` below is for.
-
-Line breaks are only added in normal dictation. Continuous mode keeps everything on one line, since it presses Enter for you and a stray newline would send half a message. Want the whole thing off? Set `FORMAT = False` in `dictation.py`.
-
-To see exactly what it does without dictating anything (no mic, no model, instant):
-
-```powershell
-.\.venv\Scripts\python.exe tools\formatcheck.py
-```
-
-It prints the same text before and after, and tells you whether formatting is live on your install. Pass your own sentence in quotes to try it on something real.
-
-## Updating
-
-Right-click **`update.ps1`**, pick "Run with PowerShell". That's it.
-
-It pulls the newest code, checks the new code is really there, restarts the app so the running copy actually picks it up, and prints what it found. Everything below is what it does for you, and why doing it by hand is easy to get wrong.
-
-**Pulling is not enough on its own.** The app auto-starts at logon and keeps the old code in memory until it's restarted, so `git pull` alone changes nothing you can see. `update.ps1` restarts it.
-
-**A packaged exe ignores source updates completely.** `ParakeetDictation.exe` has Python baked inside it, so `git pull` cannot touch it. Rebuild with `build-exe.ps1`, or download the newest zip from Releases. `update.ps1` warns you if it spots an exe next to it.
-
-**Auto-start might point at a different folder than the one you're updating.** If you once extracted the release zip somewhere and later cloned the repo elsewhere, you'd be updating a copy you never run — and everything would look broken for no visible reason. `update.ps1` compares the two paths and tells you.
-
-Restarting by hand, if you'd rather: `Stop-ScheduledTask -TaskName ParakeetDictation`, then `Start-ScheduledTask -TaskName ParakeetDictation`. There is no `Restart-ScheduledTask` cmdlet, and if a `pythonw` process survives the stop it keeps the single-instance lock, so the relaunch exits silently and nothing appears to change.
-
-To check by hand, `dictation.log` records the active text stages on every launch:
-
-```
-text pipeline: cleanup=True format=True (para_gap=0.70s)
-```
-
-No such line means you're still on the old build. And `tools\formatcheck.py` shows you before/after with no mic and no model, so you can confirm the rules work without dictating anything.
-
 Two small safety nets, because losing a long dictation hurts: the transcription stays in your clipboard after it's typed, so if you clicked into the wrong window you can just Ctrl+V it where it belonged. And every transcription is also appended to `transcripts.log` next to the app (plain text, stays on your machine, never uploaded), so nothing you say is ever truly lost.
 
 ## Teach it your words

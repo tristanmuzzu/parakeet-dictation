@@ -75,33 +75,16 @@ Registers Task Scheduler task `ParakeetDictation` (at logon, elevated, silent) a
 | int8 download fails midway | Interrupted Hugging Face snapshot; loader then errors with "incomplete snapshot" | Re-run `selftest.py` with network; or delete `%USERPROFILE%\.cache\huggingface\hub\models--istupakov--parakeet-tdt-0.6b-v3-onnx` and retry. |
 | Model load very slow (~90 s) | fp32 fallback active | Confirm int8 weights downloaded (`encoder-model.int8.onnx` in the HF cache); rerun selftest with network. |
 | Text pastes but clipboard lost | Should not happen (old clipboard is restored), but clipboard managers can interfere | Note it to the user; harmless. |
-| User updated but behaviour is unchanged — **run `update.ps1` first, it diagnoses all three causes below** | **The old process is still running.** Auto-start launches at logon and holds the previous code in memory; a `git pull` does not touch it. Source edits also never reach a packaged `ParakeetDictation.exe`, which bundles its own Python. | Check `dictation.log` for the `text pipeline: cleanup=... format=...` line written on every launch — absent or stale means old code. Restart with `Stop-ScheduledTask` then `Start-ScheduledTask` (there is **no** `Restart-ScheduledTask` cmdlet), and kill any `pythonw` left holding the single-instance lock on 127.0.0.1:49731 or the relaunch exits silently. For the exe, rebuild via `build-exe.ps1` or install the new release zip. Verify text-stage changes with no mic via `tools/formatcheck.py`. |
 
 ## 7. Customization the user may ask for
 
 - **Different hotkey**: edit the combo logic in `on_key()` in `dictation.py` (track the desired key names in `keys_down`). Keep the raw-hook pattern.
 - **Disable filler cleanup** (keep "um"s): set `CLEANUP = False` in `dictation.py`.
-- **Disable structural formatting** (no lists/quotes/paragraph breaks): set `FORMAT = False` in `dictation.py`. Tune the pause that starts a new paragraph with `PARA_GAP` (seconds of leading silence on a segment; default 0.7, which corresponds to roughly a 1.3 s real-world pause because `SILENCE_CUT` already consumed the first 0.6 s).
 - **Fix mangled names/brands**: edit `dictionary.txt` next to the app (created on first run, in the repo root from source). Primary syntax is one correct word/phrase per line (e.g. `FeWo direkt`); the app sound-matches and rewrites anything transcribed that sounds close, so wrong spellings are never enumerated. Only entries whose every word is 4+ letters are sound-matched. Advanced override: a `wrong -> right` line (with `|`-separated alternatives) still works and runs before the sound-matching. Case-insensitive, hot-reloads on save. It holds personal names, so it is gitignored; do not commit it.
 - **English-only / other model**: change `MODEL_NAME` (see onnx-asr supported models).
 - **Recover a lost dictation**: the last transcription is still in the clipboard (Ctrl+V), and every transcription is appended to `transcripts.log` in the repo root. Both by design; do not "clean up" the history write or re-add clipboard restore.
 
-## 8. Structural formatting (what it is, and what NOT to replace it with)
-
-After `clean_text`, a rule-based pass (`format_text` + `join_segments` in `dictation.py`) makes dictated text readable: sentence capitalization after `.!?`, spoken enumerations ("first off … secondly … lastly") into numbered lists, "quote … unquote" into real quotation marks, and long speaking pauses into paragraph breaks.
-
-The paragraph rule is the non-obvious one. `Segmenter` records, per emitted segment, the seconds of silence sitting in front of its speech (`Segmenter.lead_gaps`, index-aligned with emission order, surfaced by `AsrSession.ordered_pairs()`). A cut fires the instant `SILENCE_CUT` is reached, so the pause length is invisible at the cut itself — the remainder lands as leading silence on the *next* segment, which is what gets measured. A break is inserted only when the pause is long **and** the previous segment ended on `.!?`, so it can never land mid-sentence.
-
-Design constraints, all deliberate — do not "improve" these without reading the reasoning:
-
-- **Do not replace this with a local LLM.** It was evaluated and rejected for the target hardware (4-core Zen 2 laptop CPU, no discrete GPU). An LLM rewrite is autoregressive, so it costs seconds per dictation and competes with the ASR worker for the same cores, which defeats the streaming design. Rules are instant and cannot hallucinate words the user did not say. If a user has a real GPU and asks for it, add it as an opt-in extra pass, never as a replacement, and gate it behind a diff check that falls back to the raw text.
-- **Every rule must no-op when unsure.** A missed list is acceptable; a corrupted dictation is not. That is why enumerations require a run starting at "first", strictly ascending ordinals, and `MIN_LIST_ITEM_WORDS` of content per item, and why quotes require both delimiters within `MAX_QUOTE_CHARS`.
-- **Marker strength is the core of the enumeration heuristic.** `_STRONG_ORDINALS` ("secondly", "first off", "number two") have no non-enumerating use in English, so they count anywhere — real speech buries them mid-clause ("...I headed home and thirdly I..."). Weak markers (bare "first", "second", "finally") are ordinary words, so they only count when punctuation follows them ("first," or "first.", meaning the speaker paused) or when they open a sentence. That one test separates "first, run towards the tree" from "the first thing I noticed", and it is why the relaxation did not cost any false-positive safety. Do not loosen weak markers to match anywhere.
-- **Line breaks are gated by `allow_breaks`**, which is false in continuous mode. Continuous mode presses Enter for you; a newline reaching the target window first would submit a half-finished message.
-- `clean_text` is newline-aware (collapses horizontal whitespace only). Do not restore the old `\s{2,}` collapse — it would flatten every paragraph break.
-- Tests: `tests/test_format.py` (31 cases, mostly negative — proving rules decline rather than mangle) and the `lead_gaps` cases in `tests/test_segmenter.py`.
-
-## 9. Maintain the user's dictionary for them (standing instruction)
+## 8. Maintain the user's dictionary for them (standing instruction)
 
 If the user dictates their prompts to you through this app, you will sometimes SEE the transcription faults in the text you receive. When that happens, fix the dictionary for them:
 
@@ -110,7 +93,7 @@ If the user dictates their prompts to you through this app, you will sometimes S
 - **Then tell the user, briefly:** one line like "Added 'FeWo direkt' to your dictation dictionary, it'll come out right from now on." Never do it silently.
 - **Rules:** never remove or rewrite existing entries without being asked; the file is personal data, never commit or upload it; entries take effect on the user's next dictation automatically (hot reload, no restart).
 
-## 10. What NOT to do
+## 9. What NOT to do
 
 - Do not commit or upload `dictation.log`, `.venv/`, or the Hugging Face cache.
 - Do not run multiple instances or register the scheduled task twice (use `-Force` semantics of the installer instead).
