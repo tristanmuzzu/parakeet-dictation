@@ -98,8 +98,17 @@ if (Test-Path $py) {
 Head "Restarting the app"
 if ($task) {
     try {
+        # Note: there is no Restart-ScheduledTask cmdlet. Stop, then start.
         Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
+        # Stopping the task does not always take the process with it, and the
+        # app holds a single-instance lock on 127.0.0.1:49731 — a survivor makes
+        # the relaunch exit SILENTLY, which looks exactly like "the update did
+        # nothing". Clear any leftovers from this folder first.
+        Get-Process pythonw, python, ParakeetDictation -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and $_.Path.StartsWith($dir) } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
         Start-ScheduledTask -TaskName $taskName
         Say "Scheduled task restarted." "Green"
     } catch {

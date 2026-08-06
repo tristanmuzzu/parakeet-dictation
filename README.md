@@ -108,6 +108,8 @@ It pulls the newest code, checks the new code is really there, restarts the app 
 
 **Auto-start might point at a different folder than the one you're updating.** If you once extracted the release zip somewhere and later cloned the repo elsewhere, you'd be updating a copy you never run — and everything would look broken for no visible reason. `update.ps1` compares the two paths and tells you.
 
+Restarting by hand, if you'd rather: `Stop-ScheduledTask -TaskName ParakeetDictation`, then `Start-ScheduledTask -TaskName ParakeetDictation`. There is no `Restart-ScheduledTask` cmdlet, and if a `pythonw` process survives the stop it keeps the single-instance lock, so the relaunch exits silently and nothing appears to change.
+
 To check by hand, `dictation.log` records the active text stages on every launch:
 
 ```
