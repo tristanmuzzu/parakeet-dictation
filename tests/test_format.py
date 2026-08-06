@@ -38,6 +38,14 @@ def test_leaves_abbreviations_alone():
     print("ok test_leaves_abbreviations_alone")
 
 
+def test_capitalizes_after_the_word_no():
+    # "no" is a sentence-ending word far more often than an abbreviation for
+    # "number", so it must not suppress the next capital.
+    got = format_text("I asked him and he said no. then he walked off.")
+    assert got == "I asked him and he said no. Then he walked off.", got
+    print("ok test_capitalizes_after_the_word_no")
+
+
 def test_leaves_initials_alone():
     got = format_text("Ask J. smith about it.")
     assert got == "Ask J. smith about it.", got
@@ -68,6 +76,38 @@ def test_bare_quote_word_untouched():
     src = "Can you quote me a price for that work?"
     assert format_text(src) == src, format_text(src)
     print("ok test_bare_quote_word_untouched")
+
+
+def test_unclosed_quote_closes_at_sentence_end():
+    # People open a quote out loud and almost never close it. From a real
+    # dictation: "...said, quote I don't like you. So yeah..."
+    got = format_text("He looked at me and said, quote I don't like you. "
+                      "So yeah, that was strange.")
+    assert got == ('He looked at me and said, "I don\'t like you." '
+                   'So yeah, that was strange.'), got
+    print("ok test_unclosed_quote_closes_at_sentence_end")
+
+
+def test_unclosed_quote_after_speech_verb_without_comma():
+    got = format_text("He said quote I don't like you at all. Then he left.")
+    assert got == 'He said "I don\'t like you at all." Then he left.', got
+    print("ok test_unclosed_quote_after_speech_verb_without_comma")
+
+
+def test_quote_as_verb_or_noun_never_closes():
+    # Nothing introduces these, so they are ordinary words.
+    for src in ["Can you quote me a price for that work?",
+                "I need a quote from the supplier by Friday.",
+                "The quote was too expensive so we walked away.",
+                "Please quote the lowest number you can manage."]:
+        assert format_text(src) == src, format_text(src)
+    print("ok test_quote_as_verb_or_noun_never_closes")
+
+
+def test_one_word_quote_rejected():
+    src = "He said, quote no. Then he walked off."
+    assert format_text(src) == src, format_text(src)
+    print("ok test_one_word_quote_rejected")
 
 
 def test_absurdly_long_quote_span_rejected():

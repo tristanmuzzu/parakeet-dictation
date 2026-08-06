@@ -139,8 +139,12 @@ PARA_GAP = 0.7           # leading silence (s) on a segment that starts a new pa
 
 # Words that legitimately end in a period mid-sentence, so the next word must
 # NOT be capitalized. Single letters ("J. Smith", "e.g.") are handled by rule.
+# "no" is deliberately NOT here. It is an abbreviation for "number" perhaps
+# once in a thousand dictations and an ordinary sentence-ending word the rest
+# of the time — listing it silently broke capitalization after "I said no."
+# and let an unclosed quote run past the sentence it belonged to.
 _ABBREV = frozenset("""
-e.g i.e etc vs approx no nos fig cf al st jr sr inc ltd co dept vol
+e.g i.e etc vs approx fig cf al st jr sr inc ltd co dept vol
 dr mr mrs ms prof gen sgt lt capt rev hon
 z.b bzw usw ca u.a d.h evtl ggf inkl bzgl
 """.split())
@@ -201,6 +205,23 @@ _TRAILING_WORD_RX = re.compile(r"(?:^|[\s,;:])([^\W\d_]+)$")
 MIN_LIST_ITEM_WORDS = 3   # below this it is counting, not enumerating
 MAX_QUOTE_CHARS = 200     # longer than this and the two markers are unrelated
 
+# People open a quote out loud far more often than they close one — "he said
+# quote I don't like you" and then they just keep talking. So an unclosed
+# "quote" is also honoured, running to the end of that sentence.
+#
+# On its own that would wreck "can you quote me a price", where "quote" is an
+# ordinary verb. The tell is what sits in FRONT of it: a real spoken quote is
+# introduced, either by punctuation ("said, quote ...") or by a speech verb
+# ("said quote ..."). Nothing else opens a quote.
+_SPEECH_VERBS = frozenset("""
+said says say saying tells tell told telling wrote writes write writing
+states stated state asks asked ask replies replied reply answers answered
+mentions mentioned notes noted goes went quoting
+""".split())
+
+_OPEN_QUOTE_RX = re.compile(r"\bquote\b[,:]?\s+", re.IGNORECASE)
+_TERMINATOR_RX = re.compile(r"[.!?]")
+
 
 def _quote_sub(m):
     """Turn a spoken quote into a real one, unless the span is implausibly long
@@ -244,6 +265,48 @@ _SENT_LEAD = re.compile(
     r",?[ \t]+)?$",
     re.IGNORECASE,
 )
+
+
+def _is_quotative(t, pos):
+    """True if the "quote" at pos is introducing speech rather than being an
+    ordinary verb ("quote me a price") or noun ("a quote from the supplier")."""
+    head = t[:pos].rstrip()
+    if head.endswith((",", ":")):
+        return True
+    m = _TRAILING_WORD_RX.search(head)
+    return bool(m and m.group(1).lower() in _SPEECH_VERBS)
+
+
+def _sentence_end_after(t, start):
+    """Index just past the first real sentence terminator at or after start."""
+    for m in _TERMINATOR_RX.finditer(t, start):
+        if t[m.start()] == "." and _is_abbreviation(t, m.start()):
+            continue
+        return m.start() + 1
+    return len(t)
+
+
+def _close_open_quotes(t):
+    """Close a spoken quote the user opened but never closed, at the end of the
+    sentence it opened in. Runs after the paired "quote ... unquote" rule, so
+    anything reaching here is genuinely unpaired."""
+    out = []
+    pos = 0
+    for m in _OPEN_QUOTE_RX.finditer(t):
+        if m.start() < pos or not _is_quotative(t, m.start()):
+            continue
+        end = _sentence_end_after(t, m.end())
+        inner = t[m.end():end].strip()
+        # One word is a mis-hearing, not a quotation; over the cap it ran away.
+        if len(inner.split()) < 2 or len(inner) > MAX_QUOTE_CHARS:
+            continue
+        out.append(t[pos:m.start()])
+        out.append('"%s"' % inner)
+        pos = end
+    if not out:
+        return t
+    out.append(t[pos:])
+    return "".join(out)
 
 
 def _item_cut_start(t, pos):
@@ -346,7 +409,8 @@ def format_text(t, allow_breaks=True):
     if not t:
         return t
     t = _capitalize_sentences(t)
-    t = _QUOTE_RX.sub(_quote_sub, t)
+    t = _QUOTE_RX.sub(_quote_sub, t)      # "quote X unquote"
+    t = _close_open_quotes(t)             # "he said quote X." (never closed)
     if allow_breaks:
         t = _apply_enumeration(t)
     return t
