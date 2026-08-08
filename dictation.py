@@ -30,6 +30,13 @@ import logging
 
 import numpy as np
 
+import linux_backend
+
+# On Linux the global hotkey comes from GNOME (see install-gnome-hotkeys.sh) and
+# text is inserted via wl-copy + ydotool; the `keyboard` package is neither
+# importable-without-root nor functional under Wayland. See linux_backend.py.
+IS_LINUX = linux_backend.is_linux()
+
 # Where we write our side files (dictation.log, transcripts.log). Next to the
 # .exe when frozen by PyInstaller (sys.executable is the exe), next to this
 # source file otherwise. Both routes therefore keep their logs beside the thing
@@ -51,6 +58,19 @@ MIN_SECONDS = 0.3  # ignore taps shorter than this
 # Ctrl+Alt+Q quit) are implemented via a raw keyboard hook in main() — see
 # on_key() and the comment there for why add_hotkey() string combos are NOT used.
 CLEANUP = True     # strip filler words (um/uh/...) and tidy spacing
+
+# Which microphone to record from. Empty means "whatever the system calls the
+# default input", which is the right default but NOT always a working device:
+# this machine exposes two internal capture devices and the one the audio server
+# prefers on priority ("Stereo Microphone", priority 200) is deaf, while the one
+# that actually hears the room ("Digital Microphone", priority 100) loses the
+# tie. Every profile change re-runs that tie-break, so the default can silently
+# become a dead mic and every dictation comes back empty. Set this (env var, or
+# edit here) to pin recording to a device by name substring or index and take
+# the audio server's guess out of the loop. PortAudio reports the audio server's
+# node names, so on this machine the working mic is PARAKEET_INPUT_DEVICE=Mic1
+# ("alsa_input.pci-0000_04_00.6.HiFi__Mic1__source"); Mic2 is the deaf one.
+INPUT_DEVICE = os.environ.get("PARAKEET_INPUT_DEVICE", "").strip()
 
 # Command keywords detected at the end of transcribed speech, ONLY while
 # continuous mode is on: a one-shot dictation legitimately ends in "sent" or
@@ -734,6 +754,43 @@ def acquire_single_instance():
     return True
 
 
+def _resolve_input_device(sd):
+    """Turn INPUT_DEVICE into something sounddevice accepts, or None for default.
+
+    Accepts an index ("6") or a case-insensitive substring of the device name, so
+    a human can write "Digital" instead of hunting for the index that PortAudio
+    happens to hand out this boot. An unmatched name is logged and ignored rather
+    than raised: falling back to the default mic is a better failure than not
+    recording at all.
+    """
+    if not INPUT_DEVICE:
+        return None
+    if INPUT_DEVICE.isdigit():
+        return int(INPUT_DEVICE)
+    needle = INPUT_DEVICE.lower()
+    try:
+        for idx, dev in enumerate(sd.query_devices()):
+            if dev.get("max_input_channels", 0) > 0 and needle in dev["name"].lower():
+                return idx
+    except Exception:
+        log.exception("could not enumerate input devices")
+        return None
+    log.warning("PARAKEET_INPUT_DEVICE=%r matched no input device - using the "
+                "system default", INPUT_DEVICE)
+    return None
+
+
+def _describe_input_device(sd, active_stream):
+    """Human-readable name of the device a live stream actually opened."""
+    try:
+        idx = active_stream.device
+        if isinstance(idx, (list, tuple)):
+            idx = idx[0]
+        return f"{sd.query_devices(idx)['name']} (index {idx})"
+    except Exception:
+        return "unknown"
+
+
 def start_recording():
     global stream, frames, session
     import sounddevice as sd
@@ -752,9 +809,15 @@ def start_recording():
             frames.append(indata.copy())
 
     try:
+        device = _resolve_input_device(sd)
         stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                                dtype="float32", callback=cb)
+                                dtype="float32", callback=cb, device=device)
         stream.start()
+        # Name the device in the log on every take. When a dictation comes back
+        # empty the first question is always "which microphone was that?", and
+        # answering it from the log beats guessing from the audio server's
+        # current state minutes later.
+        log.info("input device: %s", _describe_input_device(sd, stream))
     except Exception as e:
         log.exception("mic open failed")
         session.cancel()
@@ -850,6 +913,13 @@ def stop_and_transcribe():
             if out:
                 save_transcript(out)
                 paste_text(out)
+            else:
+                # An empty transcript used to fall through here in total silence:
+                # nothing pasted, nothing written to transcripts.log, no message
+                # on screen. To the user that is indistinguishable from a broken
+                # paste, and it sent us hunting through the delivery path when
+                # the real fault was upstream of it. Say which one it is.
+                report_empty_transcript(audio)
             if cmd:
                 press_command_key(cmd)
             log.info("stop-to-paste: %.1fs (%d segments, %d chars)",
@@ -869,6 +939,45 @@ def stop_and_transcribe():
     threading.Thread(target=work, daemon=True).start()
 
 
+def report_empty_transcript(audio):
+    """Explain an empty transcript instead of silently dropping it.
+
+    There are two very different reasons the model returns nothing, and the user
+    cannot tell them apart from the outside:
+
+      - the microphone delivered no sound at all (dead device, muted input, wrong
+        device picked as the system default), or
+      - real audio arrived and the model just did not find words in it.
+
+    The loudest 30 ms frame in the take separates the two, using the same floor
+    the segmenter uses, so the verdict here always agrees with the segmenter's.
+    """
+    peak_frame = 0.0
+    try:
+        n = audio.size // (SAMPLE_RATE * FRAME_MS // 1000)
+        if n:
+            fl = SAMPLE_RATE * FRAME_MS // 1000
+            frames_2d = audio[:n * fl].reshape(n, fl)
+            peak_frame = float(np.sqrt(np.mean(frames_2d * frames_2d, axis=1)).max())
+    except Exception:
+        log.exception("could not measure the take's level")
+
+    if peak_frame <= ABS_FLOOR:
+        log.warning("EMPTY TRANSCRIPT - no audio above the silence floor "
+                    "(loudest 30ms frame %.5f <= floor %.5f). The microphone "
+                    "delivered silence: check that the system default input is "
+                    "a device that can actually hear, or pin one with "
+                    "PARAKEET_INPUT_DEVICE.", peak_frame, ABS_FLOOR)
+        ui_q.put(("status", "no sound from microphone"))
+    else:
+        log.warning("EMPTY TRANSCRIPT - audio was present (loudest 30ms frame "
+                    "%.5f > floor %.5f) but the model found no words in it.",
+                    peak_frame, ABS_FLOOR)
+        ui_q.put(("status", "no speech recognised"))
+    # Leave the pill up long enough to be read; the caller hides it afterwards.
+    time.sleep(1.8)
+
+
 def save_transcript(text):
     """Append the transcription to a local history file (transcripts.log,
     next to the app, never committed). Safety net for the day the paste
@@ -882,6 +991,10 @@ def save_transcript(text):
 
 
 def paste_text(text):
+    if IS_LINUX:
+        linux_backend.paste_text(text)
+        return
+
     import keyboard
     import pyperclip
 
@@ -896,6 +1009,10 @@ def press_command_key(cmd):
     """Fire a command keystroke ("enter" or a digit) after paste_text. The wait
     gives the target app time to process the Ctrl+V first — slow apps would
     otherwise see the Enter land before the pasted text."""
+    if IS_LINUX:
+        linux_backend.press_command_key(cmd)
+        return
+
     import keyboard
 
     time.sleep(0.15)
@@ -1175,12 +1292,23 @@ class Overlay:
 def main():
     global worker_conn
     import tkinter as tk
-    import keyboard
+    if not IS_LINUX:
+        import keyboard
 
     log.info("=== app starting (pid=%s) ===", os.getpid())
     if not acquire_single_instance():
         log.info("another instance already running - exiting")
         return
+
+    if IS_LINUX:
+        # GNOME owns the key grab and pokes us over the lock socket, so the
+        # single-instance port doubles as the command channel.
+        linux_backend.serve_commands(_lock_sock, {
+            "toggle": toggle,
+            "toggle-continuous": toggle_continuous,
+            "cancel": cancel,
+            "quit": quit_app,
+        })
 
     # Make sure the editable dictionary.txt exists (first run drops the commented
     # template next to the exe / in the repo root) and load it now, so the rule
@@ -1296,8 +1424,11 @@ def main():
             if k in ("ctrl", "windows"):
                 combo["active"] = False
 
-    keyboard.hook(on_key)
-    log.info("manual hotkey hooks installed (ctrl+win, ctrl+shift+win, locale-aware)")
+    if not IS_LINUX:
+        keyboard.hook(on_key)
+        log.info("manual hotkey hooks installed (ctrl+win, ctrl+shift+win, locale-aware)")
+    else:
+        log.info("linux: hotkeys served by GNOME via the command channel")
     log.info("entering mainloop")
     root.mainloop()
     try:
@@ -1310,4 +1441,9 @@ def main():
 
 if __name__ == "__main__":
     mp.freeze_support()
+    # `--send <cmd>` is the client half of the Linux hotkey path: GNOME binds a
+    # key to it, it pokes the running app and exits. Handled before anything
+    # heavy is imported so the keypress round-trip stays in the low ms.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--send":
+        sys.exit(linux_backend.send_command(sys.argv[2]))
     main()
