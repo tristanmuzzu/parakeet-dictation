@@ -1222,6 +1222,53 @@ def _lerp_hex(a, b, t):
     return f"#{r:02x}{g:02x}{bl:02x}"
 
 
+def pump_ui(ov):
+    """Drain the UI queue into whichever overlay is running.
+
+    Shared by both overlays. On Linux the chip is drawn by GTK (see
+    overlay_gtk.py — tk cannot do per-pixel transparency on X11); on Windows it
+    is still the tkinter one, which keeps its real `-transparentcolor` support.
+    Both expose the same show_pill / show_mini / hide / after / destroy surface,
+    so this dispatch does not need to know the difference.
+
+    Returns False when the app is quitting, so the caller stops rescheduling.
+    """
+    try:
+        while True:
+            msg = ui_q.get_nowait()
+            kind = msg[0]
+            if kind == "show":
+                ov.show_pill("Transcribing", "#ff5b6a", "recording")
+            elif kind == "listen":
+                ov.show_pill("Listening", "#ff5b6a", "recording")
+            elif kind == "processing":
+                ov.show_pill("Transcribing", "#f5b23e", "processing")
+            elif kind == "loading":
+                ov.show_mini("#f5b23e")
+            elif kind == "status":
+                ov.show_pill(msg[1], "#f5b23e", "status")
+            elif kind == "hide":
+                ov.hide()
+            elif kind == "restart":
+                ov.hide()
+                ov.root.after(400, restart_if_continuous)
+            elif kind == "inline_cmd":
+                handle_inline_command()
+            elif kind == "quit":
+                ov.root.destroy()
+                return False
+    except queue.Empty:
+        pass
+    return True
+
+
+def _gtk_poll(ov):
+    """The GTK half of the poll loop. GLib timeouts replace tk's `after`."""
+    if pump_ui(ov) is False:
+        return
+    ov.after(60, lambda: _gtk_poll(ov))
+
+
 class Overlay:
     # `-transparentcolor` is a Windows-only tk attribute; on X11/XWayland the
     # call below fails and the window really does paint KEY. So KEY is chosen to
@@ -1382,39 +1429,15 @@ class Overlay:
         self.root.withdraw()
 
     def poll(self):
-        try:
-            while True:
-                msg = ui_q.get_nowait()
-                kind = msg[0]
-                if kind == "show":
-                    self.show_pill("Transcribing", "#ff5b6a", "recording")
-                elif kind == "listen":
-                    self.show_pill("Listening", "#ff5b6a", "recording")
-                elif kind == "processing":
-                    self.show_pill("Transcribing", "#f5b23e", "processing")
-                elif kind == "loading":
-                    self.show_mini("#f5b23e")
-                elif kind == "status":
-                    self.show_pill(msg[1], "#f5b23e", "status")
-                elif kind == "hide":
-                    self.hide()
-                elif kind == "restart":
-                    self.hide()
-                    self.root.after(400, restart_if_continuous)
-                elif kind == "inline_cmd":
-                    handle_inline_command()
-                elif kind == "quit":
-                    self.root.destroy()
-                    return
-        except queue.Empty:
-            pass
+        if pump_ui(self) is False:
+            return
         self.root.after(60, self.poll)
 
 
 def main():
     global worker_conn
-    import tkinter as tk
     if not IS_LINUX:
+        import tkinter as tk
         import keyboard
 
     log.info("=== app starting (pid=%s) ===", os.getpid())
@@ -1460,6 +1483,31 @@ def main():
     worker_conn = parent_conn
     log.info("worker spawned (pid=%s)", worker.pid)
 
+    if IS_LINUX:
+        # GTK, because tk has no per-pixel transparency on X11: every pixel of a
+        # tk window is really painted, so a "rounded" chip has four painted
+        # corner blocks and no shadow, and hiding them means guessing the colour
+        # behind the window. GTK gets a real ARGB visual and the alpha channel
+        # survives to the compositor — verified by sampling the chip's corner
+        # pixels over a white window and getting exactly (255,255,255).
+        import overlay_gtk
+        ov = overlay_gtk.GtkOverlay()
+        root = ov
+        log.info("overlay: GTK3, rgba=%s font=%r scale=%.2f screen=%dx%d",
+                 ov.has_alpha, ov.font_family, ov.S, ov.sw, ov.sh)
+        ov.after(60, lambda: _gtk_poll(ov))
+    else:
+        import tkinter as tk
+        root = tk.Tk()
+        root.title("Parakeet Dictation")
+        ov = Overlay(root)
+
+    # Why the overlay hands focus straight back (see overlay_gtk._restore_focus):
+    # showing the chip maps a managed window, and mapping a managed window takes
+    # the keyboard here regardless of accept_focus / focus_on_map. Dictation
+    # pastes into whatever is focused, so a chip that keeps focus would send
+    # every dictation into an invisible window.
+    import tkinter as tk
     root = tk.Tk()
     root.title("Parakeet Dictation")
     ov = Overlay(root)
