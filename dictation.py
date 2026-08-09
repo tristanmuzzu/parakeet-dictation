@@ -1342,6 +1342,19 @@ class Overlay:
         self.font_family = self._pick_font()
         log.info("overlay: font=%r scale=%.2f screen=%dx%d",
                  self.font_family, self.SCALE, self.sw, self.sh)
+        # Canvas background is the chip fill, NOT the transparency key.
+        #
+        # tk cannot make the key colour transparent on X11 (-transparentcolor is
+        # Windows-only), so anything the chip does not cover is really painted.
+        # Drawing a rounded pill inside the window therefore left four painted
+        # corner blocks — invisible on a dark desktop, obvious black squares over
+        # anything light, which is exactly what Tristan could see.
+        #
+        # So the chip now fills its window edge to edge and the corners are
+        # rounded by the compositor instead: the rounded-window-corners shell
+        # extension clips window corners with real alpha, which is the one place
+        # on this machine where per-pixel transparency is actually available to
+        # an X11 window.
         self.canvas = tk.Canvas(root, bg=self.KEY, highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
         self.mode = None
@@ -1352,6 +1365,65 @@ class Overlay:
         root.withdraw()
         self._animate()
         root.after(60, self.poll)
+
+    def _shape_rounded(self, w, h, r):
+        """Clip the window itself to a rounded rectangle, via the X Shape extension.
+
+        This is the only way to get rid of the corners on this toolkit. tk has no
+        per-pixel transparency on X11 — `-transparentcolor` is Windows-only — so
+        every pixel of the window is really painted and a rounded chip drawn
+        inside it leaves four painted corner blocks. Invisible on a dark desktop,
+        obvious black squares over anything light.
+
+        X can clip the window's shape even though tk cannot blend it. tk hands us
+        the XID, GDK wraps that foreign window, and the corners are then simply
+        not part of the window: whatever is behind shows through exactly.
+
+        The mask is binary, so the corners are hard-edged rather than
+        antialiased. That is the trade for using tk at all, and a crisp corner
+        beats a black block. Fails soft: if anything here is unavailable the chip
+        just keeps square corners.
+        """
+        try:
+            # GDK must open an X11 display, not a Wayland one, or
+            # X11Window.foreign_new_for_display cannot wrap tk's XID at all. This
+            # process has no GDK_BACKEND of its own, so GDK would default to
+            # Wayland and the shape would silently never apply.
+            os.environ.setdefault("GDK_BACKEND", "x11")
+            import gi
+            gi.require_version("Gdk", "3.0")
+            from gi.repository import Gdk
+            import cairo
+        except Exception:
+            return
+        try:
+            xid = self.root.winfo_id()
+            display = Gdk.Display.get_default()
+            if display is None:
+                return
+            gwin = Gdk.X11Window.foreign_new_for_display(display, xid)
+            if gwin is None:
+                return
+            surface = cairo.ImageSurface(cairo.FORMAT_A8, int(w), int(h))
+            cr = cairo.Context(surface)
+            cr.set_source_rgba(0, 0, 0, 0)
+            cr.set_operator(cairo.OPERATOR_SOURCE)
+            cr.paint()
+            cr.set_operator(cairo.OPERATOR_OVER)
+            cr.set_source_rgba(1, 1, 1, 1)
+            import math as _m
+            r = min(r, w / 2.0, h / 2.0)
+            cr.new_sub_path()
+            cr.arc(w - r, r, r, -_m.pi / 2, 0)
+            cr.arc(w - r, h - r, r, 0, _m.pi / 2)
+            cr.arc(r, h - r, r, _m.pi / 2, _m.pi)
+            cr.arc(r, r, r, _m.pi, 3 * _m.pi / 2)
+            cr.close_path()
+            cr.fill()
+            region = Gdk.cairo_region_create_from_surface(surface)
+            gwin.shape_combine_region(region, 0, 0)
+        except Exception:
+            pass
 
     def _round_rect(self, x1, y1, x2, y2, r, **kw):
         pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r,
@@ -1377,8 +1449,26 @@ class Overlay:
         h = self.s(28)
         bw = max(1, self.s(1))
         self.root.geometry(f"{int(w)}x{h}+{(self.sw - int(w)) // 2}+{self.sh - h - self.s(96)}")
-        self._round_rect(bw, bw, w - bw, h - bw, h // 2 - bw,
-                         fill=self.PILL, outline=self.BORDER, width=bw)
+        # Edge to edge, deliberately square here: the corners are rounded by the
+        # compositor (rounded-window-corners), which can do it with real alpha.
+        # Drawing the rounding ourselves is what produced painted black corner
+        # blocks, because everything this canvas does not cover is still painted.
+        # Corner radius is a compromise, and the reason is worth writing down.
+        #
+        # tk cannot make anything transparent on X11, so whatever the chip does
+        # not cover is painted in KEY — four wedges at the corners. Their AREA
+        # grows with the radius, so a full pill (radius = h/2) produces the
+        # biggest possible black wedges, which is what showed up against a white
+        # background. A modest radius keeps the rounded look and shrinks the
+        # artifact to a few pixels.
+        #
+        # Everything that would remove it outright was tried and failed here:
+        # a GTK window with a real ARGB visual (draws correctly standalone, never
+        # becomes visible inside this app), and an X11 Shape mask over tk's own
+        # XID (never applied, on either GDK backend). See FINDINGS S-007.
+        radius = self.s(8)
+        self._round_rect(0, 0, w, h, radius, fill=self.PILL,
+                         outline=self.BORDER, width=bw)
         cy = h // 2
         dx = pad_x + dot_r
         self.dot_id = c.create_oval(dx - dot_r, cy - dot_r, dx + dot_r, cy + dot_r,
