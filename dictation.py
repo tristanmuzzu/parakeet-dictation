@@ -1483,13 +1483,28 @@ def main():
     worker_conn = parent_conn
     log.info("worker spawned (pid=%s)", worker.pid)
 
-    if IS_LINUX:
-        # GTK, because tk has no per-pixel transparency on X11: every pixel of a
-        # tk window is really painted, so a "rounded" chip has four painted
-        # corner blocks and no shadow, and hiding them means guessing the colour
-        # behind the window. GTK gets a real ARGB visual and the alpha channel
-        # survives to the compositor — verified by sampling the chip's corner
-        # pixels over a white window and getting exactly (255,255,255).
+    # The GTK chip is opt-in (PARAKEET_GTK_OVERLAY=1) and NOT the default, which
+    # is a retreat and worth being precise about.
+    #
+    # It draws the better chip and that part is proven: a real ARGB visual, round
+    # corners, a blurred shadow, and over a fullscreen white window the pixels
+    # beside it read exactly (255,255,255) — something tk can never do on X11,
+    # where it has no per-pixel transparency and every "rounded" corner is a
+    # painted block.
+    #
+    # What is not solved is stacking INSIDE THIS APP. Run standalone the chip
+    # maps at +0+0 and draws on top of everything. Run from dictation.py the same
+    # code maps at +34+33 and never becomes visible: present in the window list,
+    # GLib timers firing, offset measured and compensated, draw handler wired —
+    # and nothing on screen. set_keep_above before the map, again after it,
+    # gdk raise_() after every focus restore, and a realized anchor toplevel to
+    # reproduce the standalone conditions all failed to change it. The window
+    # never gains the compositor's "above" flag, which pipsqueak gets from the
+    # same call.
+    #
+    # An invisible status chip is worse than an ugly one, so tk is the default
+    # until that is understood. See FINDINGS S-007.
+    if IS_LINUX and os.environ.get("PARAKEET_GTK_OVERLAY") == "1":
         import overlay_gtk
         ov = overlay_gtk.GtkOverlay()
         root = ov
@@ -1507,10 +1522,6 @@ def main():
     # the keyboard here regardless of accept_focus / focus_on_map. Dictation
     # pastes into whatever is focused, so a chip that keeps focus would send
     # every dictation into an invisible window.
-    import tkinter as tk
-    root = tk.Tk()
-    root.title("Parakeet Dictation")
-    ov = Overlay(root)
     if model_cached:
         ui_q.put(("loading",))
     else:

@@ -181,6 +181,20 @@ class GtkOverlay:
         #
         # No set_type_hint() either. Adding NOTIFICATION to the POPUP was what
         # dragged the WM back into placement and parked the chip mid-screen.
+        # An anchor toplevel that is realized and never shown.
+        #
+        # Measured, and it is the difference between the chip appearing and not:
+        # standalone (where the harness happened to create another GTK toplevel
+        # first) the overlay mapped at +0+0 and drew on top of everything. Inside
+        # the app, where it was the process's only GTK window, the same code
+        # mapped at +34+33 and drew underneath whatever had the screen. Giving
+        # the process a prior toplevel reproduces the working case.
+        self._anchor = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        self._anchor.set_default_size(1, 1)
+        self._anchor.set_decorated(False)
+        self._anchor.set_skip_taskbar_hint(True)
+        self._anchor.realize()
+
         self.win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
         self.win.set_title("Parakeet Dictation")
         # The DND type hint is what makes GTK create a genuinely
@@ -455,6 +469,13 @@ class GtkOverlay:
         # top without asking for focus, which is exactly the pair we need:
         # visible over a fullscreen video, and never stealing the keyboard from
         # the window dictation is about to paste into.
+        # Re-assert keep-above AFTER the map, not just at construction. Set only
+        # on the unmapped window it did not stick: the compositor listed the
+        # overlay without the "above" flag (pipsqueak, which sets it the same
+        # way but stays mapped, kept its), so the chip was mapped and drawing
+        # underneath whatever window happened to be in front — present in the
+        # window list, invisible on screen.
+        self.win.set_keep_above(True)
         gw = self.win.get_window()
         if gw is not None:
             gw.raise_()
@@ -521,6 +542,7 @@ class GtkOverlay:
         # raise and focus are separate operations on X11, which is the only
         # reason this combination works at all.
         if self.win.get_visible():
+            self.win.set_keep_above(True)
             gw = self.win.get_window()
             if gw is not None:
                 gw.raise_()
