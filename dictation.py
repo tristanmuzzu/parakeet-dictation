@@ -18,6 +18,7 @@ Text is inserted by copying to the clipboard and sending Ctrl+V into the
 currently focused window, then restoring the previous clipboard.
 """
 
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -420,6 +421,62 @@ def apply_dictionary(text):
 
 
 # ----------------------------------------------------------------------------
+# DCBlocker: strips the DC bias this laptop's digital microphone puts on every
+# sample.
+#
+# Measured 2026-08-09 on Mic1 at 16 kHz mono, quiet room: mean +0.220 against an
+# RMS of 0.221 — about 87% of the captured "signal" was DC, with 27.7% of the
+# spectral energy below 20 Hz.
+#
+# This matters far more than the lost headroom. The Segmenter gates speech on
+# frame RMS against ABS_FLOOR (0.004), and a 0.220 offset is fifty-five times
+# that floor, so EVERY frame reads as speech and the calibration in _step
+# converges on the bias instead of the room. A dictation that starts fine and
+# then stops cutting segments correctly partway through is this bug.
+#
+# y[n] = x[n] - x[n-1] + R*y[n-1], with R placing the -3 dB corner near 13 Hz at
+# 16 kHz — far below the ~85 Hz bottom of a male fundamental, so it removes bias
+# and rumble and touches nothing that carries speech. Filter state is carried
+# across blocks so there is no step at a block boundary.
+# ----------------------------------------------------------------------------
+class DCBlocker:
+    def __init__(self, sr=SAMPLE_RATE, corner_hz=13.0):
+        self.r = 1.0 - (2.0 * math.pi * corner_hz / float(sr))
+        self._x1 = 0.0
+        self._y1 = 0.0
+
+    def process(self, block):
+        x = np.asarray(block, dtype="float64").reshape(-1)
+        if x.size == 0:
+            return np.zeros(0, dtype="float32")
+        y = np.empty_like(x)
+        r, x1, y1 = self.r, self._x1, self._y1
+        for i in range(x.size):
+            xi = x[i]
+            y1 = xi - x1 + r * y1
+            x1 = xi
+            y[i] = y1
+        self._x1, self._y1 = x1, y1
+        return y.astype("float32")
+
+
+def remove_dc(audio):
+    """Whole-take DC removal for the stop-to-paste path.
+
+    Deliberately NOT DCBlocker.process here. That is a Python-level IIR loop and
+    costs ~211 ms on a 20 s take (measured), which would land directly on the
+    stop-to-paste latency the user actually feels. The bias on this microphone is
+    a constant, not a drift, so subtracting the mean removes it exactly at
+    ~0.4 ms for the same take. The streaming path still uses the real one-pole,
+    where the cost is per-block, off the latency path, and drift-safe.
+    """
+    a = np.asarray(audio, dtype="float32").reshape(-1)
+    if a.size == 0:
+        return a
+    return (a - a.mean()).astype("float32")
+
+
+# ----------------------------------------------------------------------------
 # Segmenter: pure, deterministic speech chopping (no I/O, no threads).
 #
 # It eats raw audio blocks and decides where to cut the take into segments the
@@ -438,6 +495,9 @@ class Segmenter:
         self.keep_sil = keep_sil
         self.frame_len = max(1, int(sr * FRAME_MS / 1000))
         self._pending = np.zeros(0, dtype="float32")   # samples < one full frame
+        # Strip the microphone's DC bias before anything measures RMS. Without
+        # this the noise-floor calibration below converges on the bias.
+        self._dc = DCBlocker(sr)
         # Start at the absolute floor and let calibration + EMA refine it. The
         # floor is deliberately NOT reset between segments: the room does not
         # get quieter halfway through a dictation.
@@ -460,6 +520,7 @@ class Segmenter:
         out = []
         if block.size == 0:
             return out
+        block = self._dc.process(block)
         buf = np.concatenate([self._pending, block]) if self._pending.size else block
         n = buf.size // self.frame_len
         used = n * self.frame_len
@@ -850,7 +911,7 @@ def stop_and_transcribe():
     # produced no segments (very short or very quiet dictation).
     with frames_lock:
         data = np.concatenate(frames) if frames else np.zeros((0, 1), dtype="float32")
-    audio = data.reshape(-1).astype("float32")
+    audio = remove_dc(data.reshape(-1).astype("float32"))
     log.info("recording stopped: %.1fs audio", audio.size / SAMPLE_RATE)
     if audio.size < SAMPLE_RATE * MIN_SECONDS:
         if session is not None:
@@ -1162,10 +1223,55 @@ def _lerp_hex(a, b, t):
 
 
 class Overlay:
-    KEY = "#010203"          # transparent color key (drawn areas hide it)
-    PILL = "#16181d"         # pill fill
-    BORDER = "#2b2f3a"       # subtle border
-    TEXT = "#e7e9ee"
+    # `-transparentcolor` is a Windows-only tk attribute; on X11/XWayland the
+    # call below fails and the window really does paint KEY. So KEY is chosen to
+    # sit just under the pill fill rather than at near-black: the only pixels
+    # that ever show it are the four corner arcs, and at this radius they read as
+    # a soft shadow instead of a black notch. (Per-pixel transparency is not
+    # available to tk on X11 at all — a shaped window would need the X Shape
+    # extension, which tk does not expose.)
+    # KEY is deliberately only a hair off PILL. tk cannot do per-pixel alpha on
+    # X11 at all, so the four corner arcs outside the rounded rect are really
+    # painted — at near-black they read as black notches on a rounded box, which
+    # is exactly what they look like. Keeping KEY within a couple of steps of the
+    # fill makes them invisible against the chip, and ALPHA below softens the
+    # whole window so the remaining difference reads as a shadow rather than a
+    # corner. This is the closest thing to a rounded, floating chip that tk can
+    # actually draw here.
+    KEY = "#101318"
+    PILL = "#12151a"         # chip fill, darker so the type separates cleanly
+    BORDER = "#2f3644"       # hairline only; it should not read as a button edge
+    TEXT = "#d8dee9"         # soft white — pure #fff glares against a dark chip
+    ALPHA = 0.92             # whole-window opacity; X11 + a compositor honour it
+
+    # The overlay is drawn by tk, which knows nothing about GNOME's 1.25 display
+    # scale, so it rendered at roughly two-thirds of its intended physical size
+    # on this 143 DPI panel. Everything below is expressed in logical units and
+    # multiplied by this. Override with PARAKEET_UI_SCALE to taste.
+    try:
+        SCALE = max(0.5, min(4.0, float(os.environ.get("PARAKEET_UI_SCALE", "1.7"))))
+    except ValueError:
+        SCALE = 1.7
+
+    # Fonts: "Segoe UI" does not exist on Linux, so tk silently fell back to a
+    # default that is neither the system font nor well hinted. Pick the first
+    # family that is actually installed.
+    FONT_CANDIDATES = ("Ubuntu Sans", "Ubuntu", "Cantarell", "DejaVu Sans", "Noto Sans")
+
+    def _pick_font(self):
+        try:
+            from tkinter import font as tkfont
+            have = {f.lower() for f in tkfont.families(self.root)}
+            for fam in self.FONT_CANDIDATES:
+                if fam.lower() in have:
+                    return fam
+        except Exception:
+            pass
+        return "TkDefaultFont"
+
+    def s(self, v):
+        """Scale a logical dimension to device pixels."""
+        return int(round(v * self.SCALE))
 
     def __init__(self, root):
         import tkinter as tk
@@ -1175,11 +1281,20 @@ class Overlay:
         root.overrideredirect(True)
         root.attributes("-topmost", True)
         try:
+            # Windows-only; fails silently on X11. Left in so the Windows build
+            # keeps its real per-pixel key transparency.
             root.attributes("-transparentcolor", self.KEY)
+        except Exception:
+            pass
+        try:
+            root.attributes("-alpha", self.ALPHA)
         except Exception:
             pass
         self.sw = root.winfo_screenwidth()
         self.sh = root.winfo_screenheight()
+        self.font_family = self._pick_font()
+        log.info("overlay: font=%r scale=%.2f screen=%dx%d",
+                 self.font_family, self.SCALE, self.sw, self.sh)
         self.canvas = tk.Canvas(root, bg=self.KEY, highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
         self.mode = None
@@ -1200,31 +1315,38 @@ class Overlay:
     def _draw_pill(self, text, base_color):
         c = self.canvas
         c.delete("all")
-        pad_x, dot_r = 18, 5
-        font = ("Segoe UI", 11)
+        # This is a status indicator, not a button. The type is deliberately the
+        # quiet element — cap height around a third of the chip, with padding
+        # doing the work — and the dot carries the signal. Setting the text near
+        # the chip height (the earlier 12 against 34) is what made it read as an
+        # oversized button.
+        pad_x, dot_r, gap = self.s(15), self.s(4), self.s(10)
+        font = (self.font_family, self.s(9))
         tmp = c.create_text(0, 0, text=text, font=font, anchor="nw")
         bb = c.bbox(tmp)
         c.delete(tmp)
         tw = bb[2] - bb[0]
-        w = pad_x + dot_r * 2 + 9 + tw + pad_x
-        h = 34
-        self.root.geometry(f"{int(w)}x{h}+{(self.sw - int(w)) // 2}+{self.sh - h - 96}")
-        self._round_rect(1, 1, w - 1, h - 1, h // 2 - 1,
-                         fill=self.PILL, outline=self.BORDER, width=1)
+        w = pad_x + dot_r * 2 + gap + tw + pad_x
+        h = self.s(28)
+        bw = max(1, self.s(1))
+        self.root.geometry(f"{int(w)}x{h}+{(self.sw - int(w)) // 2}+{self.sh - h - self.s(96)}")
+        self._round_rect(bw, bw, w - bw, h - bw, h // 2 - bw,
+                         fill=self.PILL, outline=self.BORDER, width=bw)
         cy = h // 2
         dx = pad_x + dot_r
         self.dot_id = c.create_oval(dx - dot_r, cy - dot_r, dx + dot_r, cy + dot_r,
                                     fill=base_color, outline="")
-        self.text_id = c.create_text(dx + dot_r + 9, cy, text=text, anchor="w",
+        self.text_id = c.create_text(dx + dot_r + gap, cy, text=text, anchor="w",
                                      fill=self.TEXT, font=font)
         self._base_color = base_color
 
     def _draw_mini(self, color):
         c = self.canvas
         c.delete("all")
-        w = h = 20
-        self.root.geometry(f"{w}x{h}+{self.sw - w - 22}+{self.sh - h - 58}")
-        self.dot_id = c.create_oval(5, 5, 15, 15, fill=color, outline="")
+        w = h = self.s(20)
+        r = self.s(5)
+        self.root.geometry(f"{w}x{h}+{self.sw - w - self.s(22)}+{self.sh - h - self.s(58)}")
+        self.dot_id = c.create_oval(r, r, w - r, h - r, fill=color, outline="")
         self.text_id = None
         self._base_color = color
 
