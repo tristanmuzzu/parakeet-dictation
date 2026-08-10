@@ -62,6 +62,8 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 
 import cairo  # noqa: E402
 
+import screen_metrics as _screen_metrics  # noqa: E402
+
 try:
     import numpy as _np
 except Exception:                                    # pragma: no cover
@@ -272,6 +274,29 @@ class GtkOverlay:
         monitor = display.get_primary_monitor() or display.get_monitor(0)
         return monitor.get_geometry()
 
+    def _refresh_screen(self):
+        """Re-measure before every show, instead of trusting startup's answer.
+
+        Same defect the tk overlay had: the monitor was measured once in
+        __init__, so a display-scale change left every later placement doing
+        arithmetic on a desktop that no longer existed and parked the chip off
+        the bottom edge. GDK does track monitors live, but only while its main
+        loop is pumping — which it is here — so re-asking is enough. Fails soft:
+        if the query raises we keep the previous geometry.
+        """
+        try:
+            geo = self._monitor_geometry()
+        except Exception:
+            return
+        if (geo.width, geo.height) != (self.sw, self.sh):
+            print(f"[overlay] monitor now {geo.width}x{geo.height}+{geo.x}+{geo.y} "
+                  f"(was {self.sw}x{self.sh}+{self.ox}+{self.oy})",
+                  file=_sys.stderr, flush=True)
+            # The measured compositor offset belongs to the old layout.
+            self._off, self._off_known = (0, 0), False
+        self.sw, self.sh = geo.width, geo.height
+        self.ox, self.oy = geo.x, geo.y
+
     def _on_realize(self, widget):
         gw = widget.get_window()
         try:
@@ -419,22 +444,26 @@ class GtkOverlay:
         self._text = text
         self._dot = color
         self._mini = False
+        self._refresh_screen()
         cw, ch, margin = self._geometry_for(text)
         self._margin = margin
-        self._show_chip(cw, ch, margin,
-                        (self.sw - cw) // 2,
-                        self.sh - ch - self.s(72))
+        cx, cy = _screen_metrics.clamp_on_screen(
+            (self.sw - cw) // 2, self.sh - ch - self.s(72),
+            cw, ch, self.sw, self.sh)
+        self._show_chip(cw, ch, margin, cx, cy)
 
     def show_mini(self, color):
         self.mode = "loading"
         self._dot = color
         self._mini = True
+        self._refresh_screen()
         d = self.s(18)
         margin = self.s(18)
         self._margin = margin
-        self._show_chip(d, d, margin,
-                        self.sw - d - self.s(28),
-                        self.sh - d - self.s(56))
+        cx, cy = _screen_metrics.clamp_on_screen(
+            self.sw - d - self.s(28), self.sh - d - self.s(56),
+            d, d, self.sw, self.sh)
+        self._show_chip(d, d, margin, cx, cy)
 
     def _show_chip(self, cw, ch, margin, cx, cy):
         """Draw the chip at (cx, cy) inside a full-screen transparent window.

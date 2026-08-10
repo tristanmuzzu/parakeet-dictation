@@ -32,6 +32,7 @@ import logging
 import numpy as np
 
 import linux_backend
+import screen_metrics
 
 # On Linux the global hotkey comes from GNOME (see install-gnome-hotkeys.sh) and
 # text is inserted via wl-copy + ydotool; the `keyboard` package is neither
@@ -806,6 +807,18 @@ def acquire_single_instance():
     """Bind a fixed local port so only one copy of the app can run at a time."""
     global _lock_sock
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Without SO_REUSEADDR a clean shutdown locks the app out of its own port for
+    # the ~60s the last command-channel connection spends in TIME_WAIT, so
+    # `--send quit` followed by a relaunch logs "another instance already
+    # running" and exits — dictation stays down and it looks like a crash.
+    # Measured here, and it is exactly what happened restarting to pick up the
+    # overlay fix.
+    #
+    # It does NOT weaken the single-instance guarantee: on Linux SO_REUSEADDR
+    # only bypasses TIME_WAIT, and a second bind while another socket is really
+    # LISTENing still fails with EADDRINUSE (verified). Sharing a live port would
+    # need SO_REUSEPORT, which is not set.
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind(("127.0.0.1", 49731))
     except OSError:
@@ -1291,14 +1304,17 @@ class Overlay:
     TEXT = "#d8dee9"         # soft white — pure #fff glares against a dark chip
     ALPHA = 0.92             # whole-window opacity; X11 + a compositor honour it
 
-    # The overlay is drawn by tk, which knows nothing about GNOME's 1.25 display
-    # scale, so it rendered at roughly two-thirds of its intended physical size
-    # on this 143 DPI panel. Everything below is expressed in logical units and
-    # multiplied by this. Override with PARAKEET_UI_SCALE to taste.
-    try:
-        SCALE = max(0.5, min(4.0, float(os.environ.get("PARAKEET_UI_SCALE", "1.7"))))
-    except ValueError:
-        SCALE = 1.7
+    # The overlay is drawn by tk, which knows nothing about the display scale, so
+    # everything below is expressed in logical units and multiplied by this.
+    #
+    # NOT a constant any more, and that is the whole point. It used to be a
+    # hardcoded 1.7, which was a calibration for exactly one display
+    # configuration: at fractional scale 1.25 the compositor squeezed XWayland's
+    # 3072px-wide framebuffer onto a 1920px panel, so 1.7 reached the glass as
+    # 1.0625. Drop to scale 1.0 and there is no squeeze, so the same 1.7 draws
+    # the chip 70% oversized. screen_metrics measures the squeeze and solves for
+    # the multiplier instead. PARAKEET_UI_SCALE still overrides.
+    SCALE = screen_metrics.LEGACY_SCALE
 
     # Fonts: "Segoe UI" does not exist on Linux, so tk silently fell back to a
     # default that is neither the system font nor well hinted. Pick the first
@@ -1320,6 +1336,30 @@ class Overlay:
         """Scale a logical dimension to device pixels."""
         return int(round(v * self.SCALE))
 
+    def _refresh_screen(self):
+        """Re-measure the screen and the scale, right before we place the chip.
+
+        This is the fix for the chip disappearing at a scale change, and it has
+        to be a real measurement rather than another `winfo_screenwidth()`: Tk
+        reads that out of Xlib's Screen struct, which is filled in once at
+        connect and only ever refreshed by `XRRUpdateConfiguration()`. Tk never
+        calls it — `libtk8.6.so` does not even link libXrandr — so Tk's answer is
+        frozen for the life of the process. It was still reporting the old
+        3072x1728 hours after the desktop became 1920x1080, which is precisely
+        how the chip ended up placed 437px below the bottom of the screen.
+
+        Fails soft in every direction: if the measurement is unavailable we keep
+        whatever we had, which is no worse than the old behaviour.
+        """
+        got = screen_metrics.metrics(fallback_size=(self.sw, self.sh))
+        if not got:
+            return
+        sw, sh, scale = got
+        if (sw, sh, scale) != (self.sw, self.sh, self.SCALE):
+            log.info("overlay: screen now %dx%d, scale %.3f (was %dx%d, %.3f)",
+                     sw, sh, scale, self.sw, self.sh, self.SCALE)
+        self.sw, self.sh, self.SCALE = sw, sh, scale
+
     def __init__(self, root):
         import tkinter as tk
 
@@ -1339,6 +1379,7 @@ class Overlay:
             pass
         self.sw = root.winfo_screenwidth()
         self.sh = root.winfo_screenheight()
+        self._refresh_screen()
         self.font_family = self._pick_font()
         log.info("overlay: font=%r scale=%.2f screen=%dx%d",
                  self.font_family, self.SCALE, self.sw, self.sh)
@@ -1433,6 +1474,7 @@ class Overlay:
 
     def _draw_pill(self, text, base_color):
         c = self.canvas
+        self._refresh_screen()
         c.delete("all")
         # This is a status indicator, not a button. The type is deliberately the
         # quiet element — cap height around a third of the chip, with padding
@@ -1448,7 +1490,12 @@ class Overlay:
         w = pad_x + dot_r * 2 + gap + tw + pad_x
         h = self.s(28)
         bw = max(1, self.s(1))
-        self.root.geometry(f"{int(w)}x{h}+{(self.sw - int(w)) // 2}+{self.sh - h - self.s(96)}")
+        w = int(w)
+        # Clamped, so a screen that shrinks under us costs the chip a few pixels
+        # of position rather than pushing it off the desktop entirely.
+        px, py = screen_metrics.clamp_on_screen(
+            (self.sw - w) // 2, self.sh - h - self.s(96), w, h, self.sw, self.sh)
+        self.root.geometry(f"{w}x{h}+{px}+{py}")
         # Edge to edge, deliberately square here: the corners are rounded by the
         # compositor (rounded-window-corners), which can do it with real alpha.
         # Drawing the rounding ourselves is what produced painted black corner
@@ -1479,10 +1526,14 @@ class Overlay:
 
     def _draw_mini(self, color):
         c = self.canvas
+        self._refresh_screen()
         c.delete("all")
         w = h = self.s(20)
         r = self.s(5)
-        self.root.geometry(f"{w}x{h}+{self.sw - w - self.s(22)}+{self.sh - h - self.s(58)}")
+        px, py = screen_metrics.clamp_on_screen(
+            self.sw - w - self.s(22), self.sh - h - self.s(58),
+            w, h, self.sw, self.sh)
+        self.root.geometry(f"{w}x{h}+{px}+{py}")
         self.dot_id = c.create_oval(r, r, w - r, h - r, fill=color, outline="")
         self.text_id = None
         self._base_color = color
