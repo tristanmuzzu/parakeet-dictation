@@ -12,7 +12,10 @@ Architecture: TWO processes.
     from processes that hog the CPU (LowLevelHooksTimeout), which is exactly
     what loading a 600 MB ONNX model does. So the model never lives here.
   - Worker process: loads nvidia parakeet-tdt-0.6b-v3 (onnx-asr) and serves
-    recognize() requests over a multiprocessing Pipe.
+    recognize() requests over a multiprocessing Pipe. The worker is
+    disposable: after PARAKEET_IDLE_UNLOAD_SEC without dictation it is shut
+    down so its ~800 MB goes back to the OS, and the next dictation respawns
+    it transparently (see spawn_worker / idle_monitor).
 
 Text is inserted by copying to the clipboard and sending Ctrl+V into the
 currently focused window, then restoring the previous clipboard.
@@ -60,6 +63,22 @@ MIN_SECONDS = 0.3  # ignore taps shorter than this
 # Ctrl+Alt+Q quit) are implemented via a raw keyboard hook in main() — see
 # on_key() and the comment there for why add_hotkey() string combos are NOT used.
 CLEANUP = True     # strip filler words (um/uh/...) and tidy spacing
+
+# After this many seconds without any dictation activity the worker process is
+# shut down. Killing the process is deliberate: it is the only reliable way to
+# hand the worker's ~800 MB (model weights + ONNX runtime arenas + its thread
+# pool) back to the OS — releasing the model in-process leaves the allocator's
+# caches behind. The next dictation respawns the worker on the spot and simply
+# pays the model load (~4 s) in its paste latency; the microphone starts
+# recording immediately, so nothing said is lost. 0 disables idle unload.
+try:
+    IDLE_UNLOAD_SEC = float(os.environ.get("PARAKEET_IDLE_UNLOAD_SEC", "600"))
+except ValueError:
+    IDLE_UNLOAD_SEC = 600.0
+# How long a queued segment will wait for a (re)loading worker before being
+# dropped. Generous: a reload is ~4 s, so hitting this means the worker is
+# actually broken, and the drop is logged as an error.
+WORKER_READY_WAIT = 120.0
 
 # Which microphone to record from. Empty means "whatever the system calls the
 # default input", which is the right default but NOT always a working device:
@@ -663,8 +682,142 @@ frames_lock = threading.Lock()
 stream = None
 worker_conn = None
 worker_lock = threading.Lock()
+worker_proc = None
+# Set while a loaded worker is ready to recognize. Consumers (the session
+# consumer and the whole-take fallback) wait on this before touching the pipe,
+# which is what lets a recording START while a respawned worker is still
+# loading: segments queue up behind the event and flow the moment it flips.
+# Starts SET so code that drives AsrSession without ever spawning a worker
+# (the plumbing tests, smoke_pipeline) is not gated; spawn_worker clears it.
+worker_ready_evt = threading.Event()
+worker_ready_evt.set()
+# Serialises spawn/unload decisions. Ordering: always taken OUTSIDE
+# worker_lock, never while holding it.
+_worker_spawn_lock = threading.Lock()
+_ever_ready = False     # a model has finished loading at least once this run
+_last_activity = time.time()
 session = None          # the live AsrSession while recording / draining the tail
 _lock_sock = None
+
+
+def touch_activity():
+    global _last_activity
+    _last_activity = time.time()
+
+
+def model_available():
+    """Can a dictation start right now? True when the model is loaded, and
+    also when it WAS loaded and the idle timer took it down — in that case
+    start_recording() respawns the worker and the dictation just pays the
+    reload in its paste latency. Only the first-ever startup load (which may
+    include the ~460 MB model download) still refuses the hotkey."""
+    return state["model_ready"] or _ever_ready
+
+
+def spawn_worker(respawn=False):
+    """Start the ASR worker process plus the thread that consumes its one-off
+    ready/load_error handshake. That thread is the ONLY reader of the pipe
+    until worker_ready_evt is set, so the handshake can never be mistaken for
+    a recognize() reply by a session consumer (they all wait on the event).
+
+    respawn=True (reload after an idle unload) keeps hands off the UI: a
+    recording pill may already be on screen, and hiding it on ready — right
+    for the startup loading dot — would wipe a live recording indicator."""
+    global worker_conn, worker_proc
+    state["model_ready"] = False
+    worker_ready_evt.clear()
+    parent_conn, child_conn = mp.Pipe()
+    proc = mp.Process(target=asr_worker, args=(child_conn,),
+                      name="asr-worker", daemon=True)
+    proc.start()
+    worker_conn = parent_conn
+    worker_proc = proc
+    log.info("worker %s (pid=%s)", "respawned" if respawn else "spawned",
+             proc.pid)
+
+    def wait_ready():
+        global _ever_ready
+        try:
+            kind, payload = parent_conn.recv()
+        except (EOFError, OSError):
+            ui_q.put(("status", "worker died"))
+            return
+        if kind == "ready":
+            state["model_ready"] = True
+            _ever_ready = True
+            touch_activity()
+            worker_ready_evt.set()
+            log.info("worker reports ready%s",
+                     " (reloaded after idle unload)" if respawn else "")
+            if not respawn:
+                ui_q.put(("hide",))
+        else:
+            ui_q.put(("status", f"load error: {payload}"))
+
+    threading.Thread(target=wait_ready, name="worker-ready-wait",
+                     daemon=True).start()
+
+
+def ensure_worker():
+    """Bring the worker back if the idle timer (or a crash) took it down.
+    Cheap when it is already running. Returns as soon as the process is
+    spawned — the model load happens in the child, and consumers hold on
+    worker_ready_evt until it reports ready."""
+    with _worker_spawn_lock:
+        if worker_proc is not None and worker_proc.is_alive():
+            return
+        spawn_worker(respawn=True)
+
+
+def unload_idle_worker(idle):
+    """Shut the worker down after `idle` seconds without dictation. Holds the
+    spawn lock for the whole teardown so ensure_worker() can only observe
+    'alive' or 'gone', never a half-dead worker; re-checks activity under the
+    lock so a dictation that started since the monitor's unlocked peek wins."""
+    global worker_conn, worker_proc
+    with _worker_spawn_lock:
+        if (state["recording"] or state["busy"] or state["continuous"]
+                or session is not None):
+            return
+        if worker_proc is None or not worker_proc.is_alive():
+            return
+        state["model_ready"] = False
+        worker_ready_evt.clear()
+        pid = worker_proc.pid
+        with worker_lock:
+            try:
+                worker_conn.send(("quit", None))
+            except Exception:
+                log.exception("worker: quit send failed during idle unload")
+            worker_proc.join(timeout=5.0)
+            if worker_proc.is_alive():
+                log.warning("worker: no exit on quit; terminating (pid=%s)", pid)
+                worker_proc.terminate()
+                worker_proc.join(timeout=3.0)
+            try:
+                worker_conn.close()
+            except Exception:
+                pass
+        worker_conn = None
+        worker_proc = None
+        log.info("worker: unloaded after %.0fs idle (pid=%s); "
+                 "model reloads on next dictation", idle, pid)
+
+
+def idle_monitor():
+    """Poll for the idle-unload condition. Continuous mode never unloads (the
+    mic re-arms constantly and the user has declared an ongoing session)."""
+    poll = max(5.0, min(30.0, IDLE_UNLOAD_SEC / 10.0))
+    while True:
+        time.sleep(poll)
+        if not state["model_ready"]:
+            continue
+        if (state["recording"] or state["busy"] or state["continuous"]
+                or session is not None):
+            continue
+        idle = time.time() - _last_activity
+        if idle >= IDLE_UNLOAD_SEC:
+            unload_idle_worker(idle)
 
 
 # ----------------------------------------------------------------------------
@@ -785,6 +938,13 @@ class AsrSession:
                 # the pipe stays in sync. Just drop it.
                 continue
             idx, audio = item
+            # After an idle unload the respawned worker may still be loading.
+            # Hold the segment here until it reports ready — recording and
+            # segmentation upstream never notice the wait.
+            if not worker_ready_evt.wait(timeout=WORKER_READY_WAIT):
+                log.error("segment %d dropped: worker not ready after %.0fs",
+                          idx, WORKER_READY_WAIT)
+                continue
             t0 = time.time()
             try:
                 with self.lock:
@@ -893,6 +1053,12 @@ def start_recording():
 
     if state["recording"] or state["busy"]:
         return
+    # The idle timer may have unloaded the worker; bring it back BEFORE the
+    # session wires itself to worker_conn. This returns as soon as the process
+    # exists — the mic opens right away and the reload (~4 s) is paid in this
+    # dictation's paste latency, not in lost audio.
+    ensure_worker()
+    touch_activity()
     with frames_lock:
         frames = []
     # Spin up the streaming session BEFORE the mic opens, so its feeder starts
@@ -992,7 +1158,9 @@ def stop_and_transcribe():
             texts = sess.ordered_texts()
             if not texts:
                 # Nothing got segmented: fall back to exactly today's behaviour
-                # and transcribe the whole take once.
+                # and transcribe the whole take once. Same ready-gate as the
+                # consumer: a respawned worker may still be loading.
+                worker_ready_evt.wait(timeout=WORKER_READY_WAIT)
                 with worker_lock:
                     worker_conn.send(("recognize", audio, SAMPLE_RATE))
                     kind, payload = worker_conn.recv()
@@ -1043,6 +1211,7 @@ def stop_and_transcribe():
         finally:
             state["busy"] = False
             session = None
+            touch_activity()   # idle countdown starts when the work ends
             if state["continuous"]:
                 ui_q.put(("restart",))
             else:
@@ -1134,9 +1303,10 @@ def press_command_key(cmd):
 def toggle():
     log.info("hotkey fired: recording=%s busy=%s model_ready=%s",
              state["recording"], state["busy"], state["model_ready"])
+    touch_activity()
     if state["busy"]:
         return
-    if not state["model_ready"]:
+    if not model_available():
         ui_q.put(("status", "Model still loading…"))
         threading.Timer(1.5, lambda: ui_q.put(("hide",))).start()
         return
@@ -1148,6 +1318,7 @@ def toggle():
 
 def toggle_continuous():
     global session
+    touch_activity()
     if state["continuous"]:
         state["continuous"] = False
         if state["recording"]:
@@ -1156,7 +1327,7 @@ def toggle_continuous():
     else:
         state["continuous"] = True
         log.info("continuous mode on")
-        if not state["recording"] and not state["busy"] and state["model_ready"]:
+        if not state["recording"] and not state["busy"] and model_available():
             start_recording()
 
 
@@ -1165,7 +1336,7 @@ def restart_if_continuous():
     delay is a window in which the user may have toggled continuous mode OFF —
     re-check at fire time, or the mic would silently reopen after they said
     stop. start_recording() itself guards recording/busy."""
-    if state["continuous"] and state["model_ready"]:
+    if state["continuous"] and model_available():
         start_recording()
 
 
@@ -1228,6 +1399,7 @@ def handle_inline_command():
         finally:
             state["busy"] = False
             session = None
+            touch_activity()   # idle countdown starts when the work ends
             if state["continuous"]:
                 ui_q.put(("restart",))
             else:
@@ -1252,6 +1424,7 @@ def cancel():
             session.cancel()
             session.close()
             session = None
+        touch_activity()
         log.info("recording cancelled")
         if state["continuous"]:
             ui_q.put(("restart",))
@@ -1614,7 +1787,6 @@ class Overlay:
 
 
 def main():
-    global worker_conn
     if not IS_LINUX:
         import tkinter as tk
         import keyboard
@@ -1655,12 +1827,19 @@ def main():
 
     # Spawn the model worker FIRST, before any UI, so its heavy load never
     # shares a process with the keyboard hook.
-    parent_conn, child_conn = mp.Pipe()
-    worker = mp.Process(target=asr_worker, args=(child_conn,),
-                        name="asr-worker", daemon=True)
-    worker.start()
-    worker_conn = parent_conn
-    log.info("worker spawned (pid=%s)", worker.pid)
+    spawn_worker()
+
+    # Arm the idle unload: a dictation daemon that autostarts at login used to
+    # hold the loaded model (~800 MB) forever, most of it eventually paid for
+    # in swap/zram churn on a busy machine. See IDLE_UNLOAD_SEC for why the
+    # unload is a process kill and what a reload costs.
+    if IDLE_UNLOAD_SEC > 0:
+        threading.Thread(target=idle_monitor, name="idle-unload",
+                         daemon=True).start()
+        log.info("idle unload armed: worker exits after %.0fs without "
+                 "dictation (PARAKEET_IDLE_UNLOAD_SEC)", IDLE_UNLOAD_SEC)
+    else:
+        log.info("idle unload disabled (PARAKEET_IDLE_UNLOAD_SEC=0)")
 
     # The GTK chip is opt-in (PARAKEET_GTK_OVERLAY=1) and NOT the default, which
     # is a retreat and worth being precise about.
@@ -1707,21 +1886,6 @@ def main():
         # The normal ("hide",) on worker-ready clears this once the download and
         # load finish.
         ui_q.put(("status", "Downloading speech model (one time, ~460 MB)"))
-
-    def wait_ready():
-        try:
-            kind, payload = worker_conn.recv()
-        except (EOFError, OSError):
-            ui_q.put(("status", "worker died"))
-            return
-        if kind == "ready":
-            state["model_ready"] = True
-            log.info("worker reports ready")
-            ui_q.put(("hide",))
-        else:
-            ui_q.put(("status", f"load error: {payload}"))
-
-    threading.Thread(target=wait_ready, daemon=True).start()
 
     # Manual Ctrl+Win / Ctrl+Shift+Win detection via a raw hook (keyboard's
     # add_hotkey chokes
@@ -1793,7 +1957,8 @@ def main():
     root.mainloop()
     try:
         with worker_lock:
-            worker_conn.send(("quit", None))
+            if worker_conn is not None:   # idle unload may have taken it down
+                worker_conn.send(("quit", None))
     except Exception:
         pass
     log.info("mainloop exited")

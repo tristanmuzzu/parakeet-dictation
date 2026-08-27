@@ -108,6 +108,8 @@ Right-click `install-autostart.ps1`, "Run with PowerShell", say yes to the one a
 
 Two processes. A tiny one holds the keyboard shortcut, the little pill, and the mic. A second one loads the model and does the actual recognition. They're split on purpose: Windows quietly kills a keyboard hook if the process holding it hogs the CPU, and loading a 600 MB model does exactly that, so the model is kept well away from the part that listens for your shortcut. Recognition uses [onnx-asr](https://github.com/istupakov/onnx-asr) with int8 weights on the CPU. Your text goes in with a clipboard paste, and it stays in the clipboard afterward on purpose, so you can paste it again anywhere.
 
+**It gives the memory back when you're not talking.** A loaded speech model holds roughly 800 MB of RAM, and an autostarted daemon used to hold it around the clock. Now, after 10 minutes without a dictation, the model process shuts itself down and that memory goes back to your machine. Nothing changes for you: the next Ctrl+Win starts recording instantly, the model reloads while you talk, and that one dictation just pastes a few seconds later than usual. Set the `PARAKEET_IDLE_UNLOAD_SEC` environment variable to change the timeout (in seconds), or to `0` to keep the model loaded forever like before. Continuous mode never unloads.
+
 Everything happens on your machine. Your audio never goes anywhere. The only time it touches the internet is that one model download on the first run.
 
 ## Free, and yours

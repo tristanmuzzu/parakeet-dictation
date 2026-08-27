@@ -109,9 +109,33 @@ def test_empty_result_filtered():
     print("ok test_empty_result_filtered")
 
 
+def test_ready_gate_holds_segments():
+    # The idle-unload reload path: while worker_ready_evt is cleared (worker
+    # respawned, model still loading) the consumer must NOT touch the pipe;
+    # the moment it is set, every queued segment flows through in order.
+    import time
+    conn = FakeConn(["after", "reload"])
+    dictation.worker_ready_evt.clear()
+    try:
+        s = dictation.AsrSession(conn, threading.Lock())
+        s.submit(_seg())
+        s.submit(_seg())
+        s.close()
+        time.sleep(0.3)
+        assert conn._i == 0, "consumer hit the pipe before the worker was ready"
+        dictation.worker_ready_evt.set()
+        s.join_consumer(timeout=5)
+        assert conn.balanced()
+        assert s.ordered_texts() == ["after", "reload"], s.ordered_texts()
+    finally:
+        dictation.worker_ready_evt.set()   # never leave the gate closed for other tests
+    print("ok test_ready_gate_holds_segments")
+
+
 if __name__ == "__main__":
     test_ordered_join()
     test_short_dictation_single_segment()
     test_cancel_drains_pipe()
     test_empty_result_filtered()
+    test_ready_gate_holds_segments()
     print("\nALL PLUMBING TESTS PASSED")
