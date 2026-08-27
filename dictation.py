@@ -865,6 +865,28 @@ def _describe_input_device(sd, active_stream):
         return "unknown"
 
 
+def _reinit_portaudio(sd):
+    """Tear PortAudio down and bring it back up.
+
+    PortAudio is initialised once, when sounddevice is imported, and it caches
+    its device list there. If that state goes bad, every later stream start
+    fails with "PortAudio not initialized" [PaErrorCode -10000] and keeps
+    failing for the life of the process - a dictation daemon that autostarts
+    at login and runs for days then needs a manual restart to record again
+    (seen 2026-08-21, after a long session of restarting pipewire underneath
+    it). Re-initialising is the only way back, and it refreshes the cached
+    device list as a bonus, so devices that appeared after startup show up.
+
+    Deliberately tolerant of _terminate() failing: if PortAudio is already
+    torn down, the thing we want is the _initialize() that follows.
+    """
+    try:
+        sd._terminate()
+    except Exception:
+        log.exception("PortAudio terminate failed; re-initialising anyway")
+    sd._initialize()
+
+
 def start_recording():
     global stream, frames, session
     import sounddevice as sd
@@ -882,11 +904,27 @@ def start_recording():
         with frames_lock:
             frames.append(indata.copy())
 
-    try:
+    def _open():
+        # Resolve the device inside the retry, not outside it: after a
+        # re-init the cached device list is rebuilt and the index that
+        # PARAKEET_INPUT_DEVICE resolves to can legitimately have moved.
         device = _resolve_input_device(sd)
-        stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                                dtype="float32", callback=cb, device=device)
-        stream.start()
+        s = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                           dtype="float32", callback=cb, device=device)
+        s.start()
+        return s
+
+    try:
+        try:
+            stream = _open()
+        except sd.PortAudioError:
+            # One retry, because the common failure here is recoverable state
+            # inside PortAudio rather than a missing microphone. If the second
+            # attempt fails too, fall through to the handler below and report.
+            log.warning("mic open failed; re-initialising PortAudio and "
+                        "retrying once", exc_info=True)
+            _reinit_portaudio(sd)
+            stream = _open()
         # Name the device in the log on every take. When a dictation comes back
         # empty the first question is always "which microphone was that?", and
         # answering it from the log beats guessing from the audio server's
