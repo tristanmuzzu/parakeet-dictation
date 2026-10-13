@@ -6,3 +6,9 @@ dist/
 build/
 *.spec
 dictionary.txt
+settings.json
+history.sqlite3*
+.settings-*
+.local-editor/
+
+.local-speech/

@@ -28,15 +28,16 @@ def speech(sec, rng):
 
 def test_cut_on_speech_then_silence():
     rng = np.random.default_rng(0)
-    wav = np.concatenate([silence(0.4, rng), speech(3.2, rng),
+    wav = np.concatenate([silence(0.4, rng), speech(MIN_SEG + 0.2, rng),
                           silence(0.8, rng), speech(1.0, rng)])
     seg = Segmenter()
     emitted = seg.push(wav)
     assert len(emitted) == 1, f"expected 1 cut, got {len(emitted)}"
     # Cut fires after 0.6s of silence; trailing silence is trimmed to ~0.2s, so
-    # the segment is roughly 0.4 (lead) + 3.2 (speech) + 0.2 (kept) = 3.8s.
+    # the segment retains the leading audio, speech, and ~0.2s of silence.
     got = emitted[0].size / SR
-    assert abs(got - 3.8) < 0.2, f"segment length {got:.2f}s not ~3.8s"
+    expected = MIN_SEG + 0.8
+    assert abs(got - expected) < 0.2, f"segment length {got:.2f}s not ~{expected}s"
     tail = seg.finalize()
     assert tail is not None, "tail (1.0s speech) should still emit"
     print("ok test_cut_on_speech_then_silence")
@@ -53,6 +54,23 @@ def test_hard_cut_at_max_seg():
     tail = seg.finalize()
     assert tail is not None, "remaining speech should emit at finalize"
     print("ok test_hard_cut_at_max_seg")
+
+
+def test_deadline_prefers_brief_pause_and_retains_following_speech():
+    rng = np.random.default_rng(11)
+    seg = Segmenter(boundary_window=4.0)
+    wav = np.concatenate([silence(.4, rng), speech(17, rng),
+                          silence(.3, rng), speech(4, rng)])
+    emitted = seg.push(wav)
+    assert len(emitted) == 1
+    assert 17.4 < emitted[0].size / SR < 18, "Cut must fall in the short pause"
+    tail = seg.finalize()
+    assert tail is not None and tail.size / SR >= 4, "Keep all following speech"
+    assert np.max(np.abs(emitted[0][-SR//10:])) < .02, "End inside quiet audio"
+    original = Segmenter().push(wav)
+    assert len(original) == 1
+    assert abs(original[0].size / SR - MAX_SEG) < .1, "Default must retain original hard deadline"
+    print("ok test_deadline_prefers_brief_pause_and_retains_following_speech")
 
 
 def test_tail_finalize():
@@ -109,6 +127,7 @@ def test_determinism():
 if __name__ == "__main__":
     test_cut_on_speech_then_silence()
     test_hard_cut_at_max_seg()
+    test_deadline_prefers_brief_pause_and_retains_following_speech()
     test_tail_finalize()
     test_no_cut_short_utterance()
     test_pure_silence_no_segment()

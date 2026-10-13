@@ -18,7 +18,7 @@ from dictation import detect_and_strip_command
 
 
 def test_send_variants():
-    for word in ("send", "sent", "sand", "sendt", "sends", "enter",
+    for word in ("send", "enter",
                  "Send", "SEND"):
         text, cmd = detect_and_strip_command(f"fix the bug and {word}")
         assert cmd == "enter", f"{word!r} should map to enter, got {cmd!r}"
@@ -27,7 +27,7 @@ def test_send_variants():
 
 
 def test_send_with_trailing_punctuation():
-    for tail in ("send.", "send,"):
+    for tail in ("send.", "send,", "send!", "send?", "send...", "send. "):
         text, cmd = detect_and_strip_command(f"looks good {tail}")
         assert cmd == "enter", f"{tail!r} should still match"
         assert text == "looks good"
@@ -38,9 +38,10 @@ def test_number_words():
     words = ["one", "two", "three", "four", "five",
              "six", "seven", "eight", "nine"]
     for i, word in enumerate(words, start=1):
-        text, cmd = detect_and_strip_command(f"option {word}")
+        text, cmd = detect_and_strip_command(word)
         assert cmd == str(i), f"{word!r} should map to {i}, got {cmd!r}"
-        assert text == "option"
+        assert text == ""
+        assert detect_and_strip_command(f"option {word}") == (f"option {word}", None)
     print("ok test_number_words")
 
 
@@ -65,9 +66,11 @@ def test_mid_sentence_is_not_a_command():
 
 
 def test_number_wins_over_send():
-    # Number check runs first: "... send one" types the digit, keeps "send".
+    # Only a bare number is a command; a sentence ending in one stays intact.
     text, cmd = detect_and_strip_command("please send one")
-    assert cmd == "1" and text == "please send"
+    assert cmd is None and text == "please send one"
+    for sentence in ("the letter was sent", "play in the sand", "choose the other one"):
+        assert detect_and_strip_command(sentence) == (sentence, None)
     print("ok test_number_wins_over_send")
 
 

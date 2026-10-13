@@ -18,7 +18,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="$(command -v python3)"
+PY="${PARAKEET_PYTHON:-$(command -v python3)}"
 
 TOGGLE_KEY="${TOGGLE_KEY:-<Control><Super>space}"
 CONT_KEY="${CONT_KEY:-<Control><Shift><Super>space}"
@@ -58,8 +58,9 @@ fi
 check_conflict() {
   local key="$1" owner
   owner=$(gsettings list-recursively 2>/dev/null \
-          | grep -F "'${key}'" | grep -v "custom-keybinding" | head -1)
+          | grep -F "'${key}'" | grep -v "custom-keybinding" | head -1 || true)
   [[ -n "$owner" ]] && printf "  !! %s is already bound: %s\n     GNOME wins; this shortcut will do nothing.\n" "$key" "${owner%% *}"
+  return 0
 }
 
 add() {  # name  binding  command  slug
@@ -72,11 +73,13 @@ add() {  # name  binding  command  slug
   printf "  %-26s %s\n" "$2" "$1"
 }
 
+printf -v COMMAND '"%s" "%s/dictation.py"' "$PY" "$REPO"
+
 echo "installing GNOME keybindings:"
-add "Parakeet: toggle dictation"   "$TOGGLE_KEY" "$PY $REPO/dictation.py --send toggle"            toggle
-add "Parakeet: continuous mode"    "$CONT_KEY"   "$PY $REPO/dictation.py --send toggle-continuous" continuous
-add "Parakeet: cancel recording"   "$CANCEL_KEY" "$PY $REPO/dictation.py --send cancel"            cancel
-add "Parakeet: quit"               "$QUIT_KEY"   "$PY $REPO/dictation.py --send quit"              quit
+add "Parakeet: toggle dictation"   "$TOGGLE_KEY" "$COMMAND --send toggle"            toggle
+add "Parakeet: continuous mode"    "$CONT_KEY"   "$COMMAND --send toggle-continuous" continuous
+add "Parakeet: cancel recording"   "$CANCEL_KEY" "$COMMAND --send cancel"            cancel
+add "Parakeet: quit"               "$QUIT_KEY"   "$COMMAND --send quit"              quit
 
 printf -v joined "'%s'," "${KEEP[@]}"
 gsettings set "$ROOT" custom-keybindings "[${joined%,}]"

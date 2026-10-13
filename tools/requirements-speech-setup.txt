@@ -1,0 +1,2 @@
+# Only for preparing the optional Unified vocabulary, not inference.
+protobuf>=4.25,<8

@@ -1,121 +1,124 @@
-# Parakeet Dictation 🎙️
+# Parakeet Dictation
 
-Talk to your AI instead of typing to it. For free, forever, no word limit.
+Talk to your coding agent without a dictation subscription.
 
-![How it works: press Ctrl+Win, talk, and the text lands in seconds](docs/demo.gif)
+Press a shortcut, speak, press it again. The text pastes into the focused field.
+Recognition runs locally on your CPU with NVIDIA's multilingual Parakeet model.
+No account, word limit or cloud transcription.
 
-If you vibe-code with Cursor, Claude Code, ChatGPT or anything like them, you already know the slow part is typing out the prompt. Talking is faster. The problem is every good voice tool wants a subscription. Wispr Flow is the one most devs use and it's genuinely great, but you pay for it and it counts your words.
+![Linux recording capsule during a real microphone check](docs/media/linux-recording.png)
 
-This does the same job for nothing. Press Ctrl+Win, say whatever you want for as long as you want, press it again, and the text lands wherever your cursor is: your agent's chat box, a commit message, an email, anywhere. It transcribes in the background *while you're still talking*, so even a minute-long ramble pastes in about two or three seconds after you stop. ⚡
+Linux capsule during a microphone check. The Windows workflow is illustrated
+[here](docs/demo.gif); that animation is an illustration, not a screen recording.
 
-No word count. No monthly fee. No account. No limits, ever.
+## Install
 
-It runs a real speech model on your own machine (NVIDIA's Parakeet), so the quality is actually good, not the junk you get from the free built-in dictation. It handles 25 languages, figures out which one you're speaking on its own, and punctuates for you. It also runs fully offline, if that's your thing, but the point is that it's free and unlimited.
+| Platform | Route | Recording shortcut |
+| --- | --- | --- |
+| Windows 10/11 | [Download the ZIP](https://github.com/tristanmuzzu/parakeet-dictation/releases/latest) or build from source | Ctrl+Win |
+| Linux, GNOME with XWayland | [Source setup](docs/LINUX.md) | Choose a GNOME binding during setup |
+| macOS | Not implemented | |
 
-## Why this exists
+**Windows:** extract `ParakeetDictation-win64.zip` and launch
+`ParakeetDictation.exe`. The first run downloads about 460 MB of model weights.
+The executable is unsigned. Use source if you prefer to inspect and build it.
 
-I was paying for Wispr Flow just to talk to my coding agents all day. Then a friend pointed out you can run the speech model yourself with a small script and skip the subscription entirely. So I did. Now I talk to Claude and Cursor for free and never once think about a word limit. Figured other people stuck paying the same tax might want it too.
+**Linux:** source includes the native capsule, local settings/history and
+optional model trials. Those changes are not in the Windows 1.2.1 ZIP.
+Read [Linux setup](docs/LINUX.md) before installing desktop hotkeys.
 
-## Get it running (no Python needed)
+## Send your agent here
 
-The easy way. No Python, no setup, nothing to install.
+> Install https://github.com/tristanmuzzu/parakeet-dictation on this computer.
+> Read AGENTS.md and INSTALL.md, then follow the guide for my operating system.
+> Use default Parakeet recognition, preserve existing shortcuts, and verify a
+> sentence lands in a plain text editor. Ask before enabling login startup.
 
-1. Grab `ParakeetDictation-win64.zip` from the [Releases page](https://github.com/tristanmuzzu/parakeet-dictation/releases).
-2. Extract it anywhere you like.
-3. Double-click `ParakeetDictation.exe`.
+The guides include dependencies, verification and recovery. An existing install
+should be reused, not replaced by a second running copy.
 
-The first launch pulls down the speech model (about 460 MB, once) and shows a small "Downloading speech model" pill while it does. When that clears, you're good. After that it starts in a second or two.
+## Use it
 
-You need Windows 10 or 11 and a mic. That's it.
+On Windows, **Ctrl+Win** starts and stops recording. **Ctrl+Shift+Win** toggles
+continuous mode. **Esc** cancels a take and **Ctrl+Alt+Q** quits.
+Linux shortcuts depend on your GNOME configuration; the generic installer
+defaults to Ctrl+Super+Space.
 
-**One heads-up about Windows SmartScreen.** The exe isn't code-signed (signing costs money I'd rather not spend on a free tool), so Windows may pop up a blue "Windows protected your PC" box. Click "More info", then "Run anyway". And look, if running an unsigned exe from a stranger on the internet makes you uneasy, that's completely fair. Use the from-source route below instead: you can read every line first, and it's the exact same app.
+Recognition processes speech chunks while you talk, then finishes the remaining
+audio after stop. Latency depends on the computer and recording. The default
+model supports 25 languages and punctuation; expect occasional recognition
+errors, especially with names.
 
-## From source (you have Python)
-
-You need Windows 10 or 11, Python 3.10 to 3.12 ([grab it here](https://www.python.org/downloads/), tick "Add to PATH" during install), and a mic.
-
-**The lazy way (let your AI set it up):** hand this repo to Claude Code, Codex, Cursor, whatever you've got, and say:
-
-> Clone https://github.com/tristanmuzzu/parakeet-dictation and set it up for me, follow the AGENTS.md.
-
-[`AGENTS.md`](AGENTS.md) is a runbook written for AI agents. It has every command, how to check it worked, and the handful of things that can go wrong with the fixes.
-
-**By hand (three steps, about five minutes):**
-
-1. Download this repo (green "Code" button, then Download ZIP, then extract) or `git clone` it.
-2. Right-click `setup.ps1` and pick "Run with PowerShell". It builds a private Python environment and installs what it needs.
-3. Double-click `Start Dictation (debug).bat`. The first launch pulls down the speech model (about 460 MB, once). When the little amber dot in the bottom-right corner goes away, you're good.
-
-After that first run, just use `Start Dictation.bat` (it runs quietly in the background), or set up auto-start below and forget it exists.
-
-Both routes share the same model cache and only ever let one copy run at a time, so you can switch between the exe and the source install whenever you want without anything clashing.
-
-## Using it
-
-| Keys | What happens |
-|---|---|
-| **Ctrl + Win** | Starts listening. A small "Transcribing" pill shows up at the bottom of the screen. |
-| **Ctrl + Win** again | Stops, and types what you said into whatever window you're in. |
-| **Ctrl + Shift + Win** | Toggles continuous mode: it types what you said, then immediately starts listening again, until you toggle it off. Great for long back-and-forths with a coding agent. |
-| **Esc** | Throws away the current recording, types nothing. |
-| **Ctrl + Alt + Q** | Quits. |
-
-While continuous mode is on, a few spoken keywords become commands: end what you're saying with **"send"** (or "enter") and it presses Enter for you right after the text lands — your message goes straight off to the agent, hands never touching the keyboard. Say a bare number like **"three"** to type that digit, handy when an agent asks you to pick an option. Keywords only count at the very end of what you said, and they're only live in continuous mode, so normal dictation never eats a word.
-
-Talk in whatever language you like, even switching mid-sentence. It cleans up the obvious filler ("um", "uh", repeated words, stray spacing) on its own. That's plain text tidying, it does not reword what you said or run it through another AI.
-
-Two small safety nets, because losing a long dictation hurts: the transcription stays in your clipboard after it's typed, so if you clicked into the wrong window you can just Ctrl+V it where it belonged. And every transcription is also appended to `transcripts.log` next to the app (plain text, stays on your machine, never uploaded), so nothing you say is ever truly lost.
+The text stays on your clipboard. If paste misses the intended field, focus it
+and press Ctrl+V. Local history also keeps transcripts for recovery.
 
 ## Teach it your words
 
-Every speech model mangles the odd name or brand it was never trained on, and the annoying part is it mangles the same word a different way every time. So there's a plain-text file, `dictionary.txt`, sitting next to the app (right beside the exe, or in the repo root if you run from source). It's created for you on the first run, already filled with examples and a note on the format. You open it, add a line, save. That's the whole thing.
+Add a correct word or phrase to `dictionary.txt`, one per line. It reloads
+without restarting and sound-matches words of four or more letters. For a
+specific mistake, use an explicit correction:
 
-You just write the word the way it's actually spelled, one per line:
-
-```
-FeWo direkt
-Zeticle
-NeoData
-```
-
-That's it. From then on, anything you say that sounds like one of those gets fixed to the exact spelling you wrote, even spellings you never listed. "Fivo direct", "Fiwo direkt", "fave direkt" all quietly become "FeWo direkt". You never sit there guessing at every wrong version it might produce, which was the whole problem.
-
-It only does this for words of four letters or more (short words sound like too many other things to be safe), and it matches on how a word sounds, not its exact letters.
-
-For the rare word that comes out so mangled the sound-matching can't reach it, there's an escape hatch: an explicit correction with an arrow, wrong on the left, right on the right, alternatives split with `|`.
-
-```
+```text
 cloud code -> Claude Code
 ```
 
-Explicit corrections run first, then the sound-matching. Either way your edits apply on your very next dictation, no restart needed. Fix the handful of names the model keeps getting wrong, once, then forget about it.
+Your dictionary is local and gitignored. An agent can help maintain it when you
+ask. Do not include it in bug reports.
 
-And if you dictate into an AI agent anyway, you don't even have to maintain the file yourself. [`AGENTS.md`](AGENTS.md) tells agents that when they spot a garbled word in something you dictated (you correct yourself, or "Fible direct" obviously means a brand they know from context), they should add the proper spelling to `dictionary.txt` for you and mention they did. Your dictionary quietly gets smarter while you work.
+## Privacy and settings
 
-## Make it start on its own
+Audio is processed on your machine and is not saved by the app. First-run model
+downloads need internet; normal default recognition works offline afterward.
+The app stores transcripts locally in `transcripts.log` and, on Linux,
+`history.sqlite3`. Clipboard text remains available after insertion. Keep these
+files private, along with `dictionary.txt`, settings and diagnostic logs.
 
-Right-click `install-autostart.ps1`, "Run with PowerShell", say yes to the one admin prompt. Now it's ready about half a minute after you log in, every time, without you doing anything. Changed your mind? `uninstall-autostart.ps1` removes it.
+Filler cleanup and local prompt editing are optional. On Linux they are off by
+default; light editing requires separate local assets. Alternative speech models
+are source-only experiments, not required dependencies or default upgrades.
+See [Linux options](docs/LINUX.md#optional-models).
 
-## When something's off
+## Source setup and development
 
-- **Ctrl+Win does nothing.** Your keyboard probably reports its keys under different names (German layouts call Ctrl "strg", for example). English and German are already handled. Run `tools/keytest.py`, press your keys, see what names show up, and add them to `norm()` in `dictation.py`. Or just open an issue with your keytest output and your keyboard's language and I'll add it.
-- **Stuck on "Model still loading".** Give it a bit. The little amber dot in the corner disappears when it's ready (about 15 to 30 seconds normally).
-- **Mic error.** Check Windows Settings, Privacy, Microphone, and that you actually have an input device set.
-- **Nothing gets typed.** The window you're aiming at has to accept a normal Ctrl+V paste. Almost everything does.
-- **Want a different hotkey?** Edit the key logic in `dictation.py` (it's commented), or ask your AI to swap it for you.
+Windows uses Python 3.10 to 3.12:
 
-## The nerdy bit
+```powershell
+git clone https://github.com/tristanmuzzu/parakeet-dictation.git
+cd parakeet-dictation
+.\setup.ps1
+.\.venv\Scripts\python.exe selftest.py
+.\"Start Dictation (debug).bat"
+```
 
-Two processes. A tiny one holds the keyboard shortcut, the little pill, and the mic. A second one loads the model and does the actual recognition. They're split on purpose: Windows quietly kills a keyboard hook if the process holding it hogs the CPU, and loading a 600 MB model does exactly that, so the model is kept well away from the part that listens for your shortcut. Recognition uses [onnx-asr](https://github.com/istupakov/onnx-asr) with int8 weights on the CPU. Your text goes in with a clipboard paste, and it stays in the clipboard afterward on purpose, so you can paste it again anywhere.
+The self-test downloads the default model if missing and prints `SELFTEST_OK`.
+Linux needs system GTK bindings and desktop input tools as well as the Python
+requirements. Follow [the Linux guide](docs/LINUX.md), not the PowerShell route.
 
-**It gives the memory back when you're not talking.** A loaded speech model holds roughly 800 MB of RAM, and an autostarted daemon used to hold it around the clock. Now, after 10 minutes without a dictation, the model process shuts itself down and that memory goes back to your machine. Nothing changes for you: the next Ctrl+Win starts recording instantly, the model reloads while you talk, and that one dictation just pastes a few seconds later than usual. Set the `PARAKEET_IDLE_UNLOAD_SEC` environment variable to change the timeout (in seconds), or to `0` to keep the model loaded forever like before. Continuous mode never unloads.
+```bash
+python3 -m pytest tests/ -q
+```
 
-Everything happens on your machine. Your audio never goes anywhere. The only time it touches the internet is that one model download on the first run.
+Tests use synthetic audio and isolated stores. They do not prove microphone,
+shortcut or paste behavior. Verify those on the target desktop before reporting
+a successful installation. [Agent setup guide](INSTALL.md).
 
-## Free, and yours
+## Troubleshooting
 
-The code is [MIT](LICENSE), do what you want with it.
+- **Shortcut does nothing:** check your configured binding, whether the app is
+  running, and whether its model is ready. Windows key names can vary by layout.
+- **Microphone error:** check the selected input device and OS microphone access.
+- **Text did not appear:** Ctrl+V recovers it. Check the destination's paste
+  shortcut and, on Linux, the ydotool daemon/socket.
+- **Already running:** executable and source installs share a loopback lock on
+  `127.0.0.1:49731`. A second launch exits rather than starting another recorder.
 
-The speech model, [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), is NVIDIA's, under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). It isn't shipped in this repo, it downloads from Hugging Face on first run (the ONNX build is [istupakov/parakeet-tdt-0.6b-v3-onnx](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx)) under its own license.
+An issue with your OS, Python version and a short reproducible example helps.
+Avoid uploading your transcript history or full dictation log.
 
-Built on [onnx-asr](https://github.com/istupakov/onnx-asr), [sounddevice](https://github.com/spatialaudio/python-sounddevice), [keyboard](https://github.com/boppreh/keyboard), [pyperclip](https://github.com/asweigart/pyperclip), and NumPy. Thanks to Jonah for the nudge that started it.
+## License
+
+Code: [MIT](LICENSE). The default speech model is NVIDIA's
+[Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3),
+under CC-BY-4.0, downloaded through
+[onnx-asr](https://github.com/istupakov/onnx-asr).
+Other optional models have their own licenses. Their weights are not bundled.

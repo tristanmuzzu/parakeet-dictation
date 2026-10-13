@@ -1,5 +1,5 @@
-onnx-asr[cpu,hub]>=0.11.0
+onnx-asr[cpu,hub]>=0.12.0
 sounddevice>=0.5
 numpy>=2.0
-keyboard>=0.13.5
-pyperclip>=1.9
+keyboard>=0.13.5; sys_platform == "win32"
+pyperclip>=1.9; sys_platform == "win32"

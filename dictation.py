@@ -17,9 +17,16 @@ Architecture: TWO processes.
     down so its ~800 MB goes back to the OS, and the next dictation respawns
     it transparently (see spawn_worker / idle_monitor).
 
-Text is inserted by copying to the clipboard and sending Ctrl+V into the
-currently focused window, then restoring the previous clipboard.
+Text stays on the clipboard for recovery. Paste is dispatched once; the capsule
+hides immediately afterward, without inspecting the destination accessibility tree.
 """
+
+# GNOME launches this client for each shortcut. Exit before importing NumPy,
+# initializing logging, or reading the application store/source files.
+import sys
+if __name__ == "__main__" and len(sys.argv) >= 3 and sys.argv[1] == "--send":
+    import linux_backend
+    sys.exit(linux_backend.send_command(sys.argv[2]))
 
 import math
 import multiprocessing as mp
@@ -31,6 +38,12 @@ import sys
 import threading
 import time
 import logging
+import uuid
+import json
+import hashlib
+from pathlib import Path
+from app_store import AppStore, SPEECH_MODELS
+from prompt_editor import LiveEdit
 
 import numpy as np
 
@@ -48,6 +61,12 @@ IS_LINUX = linux_backend.is_linux()
 # the user actually launched, and source users see no change at all.
 BASE_DIR = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
             else os.path.dirname(os.path.abspath(__file__)))
+APP_VERSION = "0.2.0-dev"
+try:
+    BUILD_ID = hashlib.sha256(b"".join((Path(BASE_DIR)/name).read_bytes()
+        for name in ("dictation.py","linux_backend.py","native_ui.py","app_store.py","prompt_editor.py","speech_models.py","qwen_speech.py","transcribe_speech.py"))).hexdigest()[:12]
+except OSError:
+    BUILD_ID = APP_VERSION
 
 logging.basicConfig(
     filename=os.path.join(BASE_DIR, "dictation.log"),
@@ -62,19 +81,15 @@ MIN_SECONDS = 0.3  # ignore taps shorter than this
 # Hotkeys (Ctrl+Win toggle, Ctrl+Shift+Win continuous mode, Esc cancel,
 # Ctrl+Alt+Q quit) are implemented via a raw keyboard hook in main() — see
 # on_key() and the comment there for why add_hotkey() string combos are NOT used.
-CLEANUP = True     # strip filler words (um/uh/...) and tidy spacing
+CLEANUP = False    # preserve wording by default
+ASR_TIMEOUT = 90.0
 
-# After this many seconds without any dictation activity the worker process is
-# shut down. Killing the process is deliberate: it is the only reliable way to
-# hand the worker's ~800 MB (model weights + ONNX runtime arenas + its thread
-# pool) back to the OS — releasing the model in-process leaves the allocator's
-# caches behind. The next dictation respawns the worker on the spot and simply
-# pays the model load (~4 s) in its paste latency; the microphone starts
-# recording immediately, so nothing said is lost. 0 disables idle unload.
+# Keep the model warm between dictations. Idle unloading is opt-in because the
+# reload/warmup delay lands directly on the next take's stop-to-paste latency.
 try:
-    IDLE_UNLOAD_SEC = float(os.environ.get("PARAKEET_IDLE_UNLOAD_SEC", "600"))
+    IDLE_UNLOAD_SEC = float(os.environ.get("PARAKEET_IDLE_UNLOAD_SEC", "0"))
 except ValueError:
-    IDLE_UNLOAD_SEC = 600.0
+    IDLE_UNLOAD_SEC = 0.0
 # How long a queued segment will wait for a (re)loading worker before being
 # dropped. Generous: a reload is ~4 s, so hitting this means the worker is
 # actually broken, and the drop is logged as an error.
@@ -99,10 +114,10 @@ INPUT_DEVICE = os.environ.get("PARAKEET_INPUT_DEVICE", "").strip()
 # the focused window) would corrupt normal dictations. "send" (or common ASR
 # mishearings like "sent") presses Enter after pasting; bare number words type
 # that digit. Commands are stripped from the pasted text.
-_SEND_RX = re.compile(r"\b(send|sent|sand|sendt|sends|enter)\b[,.]?$", re.IGNORECASE)
-_NUM_RX = re.compile(r"\b(one|two|three|four|five|six|seven|eight|nine)\b[,.]?$", re.IGNORECASE)
+_SEND_RX = re.compile(r"\b(send|enter)\b[\s,.!?]*$", re.IGNORECASE)
+_NUM_RX = re.compile(r"^(zero|one|two|three|four|five|six|seven|eight|nine)[\s,.!?]*$", re.IGNORECASE)
 _NUMBER_MAP = {
-    "one": "1", "two": "2", "three": "3", "four": "4",
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
 }
 
@@ -117,6 +132,8 @@ MIN_SEG = 3.0            # need this many seconds of speech before a silence cut
 MAX_SEG = 20.0           # hard cut here even with no pause, so latency is bounded
 SILENCE_CUT = 0.6        # trailing silence that triggers a speech-based cut
 KEEP_SIL = 0.2           # trailing silence kept after trimming a cut segment
+BOUNDARY_WINDOW = 0.0    # original chunk timing; brief-pause experiment disabled
+BOUNDARY_SILENCE = 0.18  # enough quiet to avoid splitting a spoken word
 CALIB_SEC = 0.3          # first slice used to estimate the room's noise floor
 ABS_FLOOR = 0.004        # RMS below this is silence no matter what calibration says
 FLOOR_MULT = 3.0         # speech must exceed this multiple of the learned floor
@@ -125,24 +142,41 @@ EMA_ALPHA = 0.05         # how fast the noise floor tracks (slow, non-speech onl
 # Standalone filler tokens (EN + DE), removed only as whole words. Conservative
 # on purpose: does NOT touch "like"/"you know" etc. so meaning is never damaged.
 _FILLER = re.compile(
-    r"\b(u+m+|u+h+|uh+m+|e+r+m+|err+|hm+|mm+h*|ä+h+m*|ehm+)\b[,]?",
+    r"\b(u+h+|uh+m+|e+r+m+|ä+h+m*|ehm+)\b[,]?",
     re.IGNORECASE,
+)
+# Prompts often quote exact output or mention paths and identifiers. Leave those
+# spans untouched, even when they contain a word that sounds like hesitation.
+_CLEANUP_LITERAL = re.compile(
+    r"```[\s\S]*?(?:```|$)|`[^`\n]*(?:`|$)|\"(?:\\.|[^\"\\])*(?:\"|$)"
+    r"|(?<!\w)'(?:\\.|[^'\\\n])*'(?!\w)"
+    r"|“[^”]*(?:”|$)|‘[^’]*(?:’|$)"
+    r"|(?:https?://|www\.)[^\s]+|(?:[$@]|--?)[\w-]+|[/\\][\w./\\-]+"
+    r"|\b[\w]+(?:[./\\:_-][\w]+)+\b"
 )
 
 
 def clean_text(t):
-    """Cheap, instant tidy-up of raw ASR text (no LLM)."""
+    """Remove hesitations in prose, preserving literal prompt content (no LLM)."""
     if not t:
         return t
-    t = _FILLER.sub(" ", t)
-    # collapse immediate duplicate words: "the the cat" -> "the cat"
-    t = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", t, flags=re.IGNORECASE)
-    t = re.sub(r"\s+([,.!?;:])", r"\1", t)   # no space before punctuation
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    t = re.sub(r"^[\s,.;:]+", "", t)         # no leading punctuation/space
-    if t:
-        t = t[0].upper() + t[1:]
-    return t
+
+    def prose(text):
+        # Preserve uppercase abbreviations and meaningful repetitions. German
+        # "um", "like", "you know", and spoken corrections also stay intact.
+        text = _FILLER.sub(lambda m: m[0] if m[0].rstrip(",").isupper() else " ", text)
+        text = re.sub(r"[^\S\r\n]+([,.!?;:])", r"\1", text)
+        return re.sub(r"[^\S\r\n]{2,}", " ", text)
+
+    parts = []
+    end = 0
+    for literal in _CLEANUP_LITERAL.finditer(t):
+        parts.extend((prose(t[end:literal.start()]), literal[0]))
+        end = literal.end()
+    parts.append(prose(t[end:]))
+    # The recognizer supplies capitalization. Do not capitalize a leading
+    # identifier (e.g. npm) or collapse intentional newlines here.
+    return re.sub(r"^[ ,.;:]+", "", "".join(parts)).strip()
 
 
 # ----------------------------------------------------------------------------
@@ -398,6 +432,12 @@ def _apply_fuzzy(text, entries):
                 i += 1
                 continue
             window = toks[i:i + n]
+            # A fuzzy phrase may span whitespace, never numbers, punctuation,
+            # sentence boundaries or code. Otherwise "stable 42 release" loses 42.
+            if any(not re.fullmatch(r"[ \t]+", text[a[2]:b[1]])
+                   for a, b in zip(window, window[1:])):
+                i += 1
+                continue
             if _window_matches([w[0] for w in window], e):
                 repls.append((window[0][1], window[-1][2], e["text"]))
                 for j in range(i, i + n):
@@ -507,12 +547,14 @@ def remove_dc(audio):
 class Segmenter:
     def __init__(self, sr=SAMPLE_RATE,
                  min_seg=MIN_SEG, max_seg=MAX_SEG,
-                 silence_cut=SILENCE_CUT, keep_sil=KEEP_SIL):
+                 silence_cut=SILENCE_CUT, keep_sil=KEEP_SIL,
+                 boundary_window=BOUNDARY_WINDOW):
         self.sr = sr
         self.min_seg = min_seg
         self.max_seg = max_seg
         self.silence_cut = silence_cut
         self.keep_sil = keep_sil
+        self.boundary_window = boundary_window
         self.frame_len = max(1, int(sr * FRAME_MS / 1000))
         self._pending = np.zeros(0, dtype="float32")   # samples < one full frame
         # Strip the microphone's DC bias before anything measures RMS. Without
@@ -562,12 +604,12 @@ class Segmenter:
         if not self._seg:
             return None
         concat = np.concatenate(self._seg)
-        speech_ok = self._speech_samples >= MIN_SECONDS * self.sr
+        speech_ok = self._speech_samples > 0
         # Safety net: if calibration got polluted (the user spoke with no leading
         # silence) speech frames can be misread as silence, so also emit when the
         # tail simply carries sound above the absolute floor for long enough.
         rms = float(np.sqrt(np.mean(concat * concat))) if concat.size else 0.0
-        loud_ok = concat.size >= MIN_SECONDS * self.sr and rms > ABS_FLOOR
+        loud_ok = rms > ABS_FLOOR
         self._reset_segment()
         return concat if (speech_ok or loud_ok) else None
 
@@ -580,7 +622,9 @@ class Segmenter:
             self._calib_count += 1
             self._calib_remaining -= frame.size
             if self._calib_remaining <= 0:
-                self._floor = self._calib_sum / max(1, self._calib_count)
+                # Immediate speech must not become an arbitrarily loud floor.
+                # Keep the existing noise tracking but cap startup calibration.
+                self._floor = min(0.02, self._calib_sum / max(1, self._calib_count))
         thresh = max(self._floor * FLOOR_MULT, ABS_FLOOR)
         if rms > thresh:
             self._speech_samples += frame.size
@@ -588,14 +632,21 @@ class Segmenter:
         else:
             self._trailing_sil += frame.size
             if self._calib_remaining <= 0:   # track the floor on true silence only
-                self._floor = (1 - EMA_ALPHA) * self._floor + EMA_ALPHA * rms
+                self._floor = min(0.02, (1 - EMA_ALPHA) * self._floor + EMA_ALPHA * rms)
         if not allow_emit:
             return None
         # Cut A: enough speech banked and a real pause has landed. Trim the pause.
         if (self._speech_samples >= self.min_seg * self.sr
                 and self._trailing_sil >= self.silence_cut * self.sr):
             return self._cut(trim=True)
-        # Cut B: segment got too long with no pause — cut hard to bound latency.
+        # Cut B: approaching the deadline, use a brief inter-word pause rather
+        # than waiting for a sentence pause and then cutting through a word.
+        if (self.boundary_window > 0
+                and self._seg_len >= max(self.min_seg, self.max_seg-self.boundary_window) * self.sr
+                and self._speech_samples > 0
+                and self._trailing_sil >= BOUNDARY_SILENCE * self.sr):
+            return self._cut(trim=True)
+        # Cut C: nonstop speech still has a bounded maximum chunk size.
         if self._seg_len >= self.max_seg * self.sr:
             return self._cut(trim=False)
         return None
@@ -614,9 +665,8 @@ class Segmenter:
 # ----------------------------------------------------------------------------
 # Worker process: owns the model. Heavy CPU stays out of the hook process.
 # ----------------------------------------------------------------------------
-def asr_worker(conn):
+def asr_worker(conn, speech_model="parakeet"):
     import numpy as np  # noqa: F401  (worker-side import)
-    import onnx_asr
 
     # Run recognition at above-normal priority so a busy machine (other heavy
     # background processes) can't starve it into multi-minute transcriptions.
@@ -632,12 +682,9 @@ def asr_worker(conn):
 
     try:
         t0 = time.time()
-        try:
-            model = onnx_asr.load_model(MODEL_NAME, quantization="int8")
-            log.info("worker: loaded int8 model")
-        except Exception:
-            log.exception("worker: int8 load failed, falling back to fp32")
-            model = onnx_asr.load_model(MODEL_NAME)
+        from speech_models import load_speech_model
+        model = load_speech_model(speech_model, BASE_DIR, is_linux=IS_LINUX)
+        log.info("worker: selected %s", SPEECH_MODELS[speech_model])
         log.info("worker: model loaded OK in %.1fs", time.time() - t0)
         # Warm the graph once on 5s of silence. The first real recognize() pays
         # a large one-off cost (ONNX session warmup, allocator, thread pool);
@@ -670,6 +717,8 @@ def asr_worker(conn):
             except Exception as e:
                 log.exception("worker: recognize FAILED")
                 conn.send(("asr_error", str(e)))
+    if hasattr(model, "close"):
+        model.close()
 
 
 # ----------------------------------------------------------------------------
@@ -697,6 +746,11 @@ _worker_spawn_lock = threading.Lock()
 _ever_ready = False     # a model has finished loading at least once this run
 _last_activity = time.time()
 session = None          # the live AsrSession while recording / draining the tail
+app_store = None
+prompt_editor = None
+overlay = None
+last_retry = None
+active_take_id = None
 _lock_sock = None
 
 
@@ -723,13 +777,16 @@ def spawn_worker(respawn=False):
     respawn=True (reload after an idle unload) keeps hands off the UI: a
     recording pill may already be on screen, and hiding it on ready — right
     for the startup loading dot — would wipe a live recording indicator."""
-    global worker_conn, worker_proc
+    global worker_conn, worker_proc, worker_lock
+    worker_lock = threading.Lock()
     state["model_ready"] = False
     worker_ready_evt.clear()
     parent_conn, child_conn = mp.Pipe()
-    proc = mp.Process(target=asr_worker, args=(child_conn,),
+    selected = app_store.settings["speech_model"] if app_store else "parakeet"
+    proc = mp.Process(target=asr_worker, args=(child_conn, selected),
                       name="asr-worker", daemon=True)
     proc.start()
+    child_conn.close()
     worker_conn = parent_conn
     worker_proc = proc
     log.info("worker %s (pid=%s)", "respawned" if respawn else "spawned",
@@ -742,6 +799,8 @@ def spawn_worker(respawn=False):
         except (EOFError, OSError):
             ui_q.put(("status", "worker died"))
             return
+        if parent_conn is not worker_conn:
+            return
         if kind == "ready":
             state["model_ready"] = True
             _ever_ready = True
@@ -750,7 +809,7 @@ def spawn_worker(respawn=False):
             log.info("worker reports ready%s",
                      " (reloaded after idle unload)" if respawn else "")
             if not respawn:
-                ui_q.put(("hide",))
+                ui_q.put(("ready",))
         else:
             ui_q.put(("status", f"load error: {payload}"))
 
@@ -776,6 +835,8 @@ def unload_idle_worker(idle):
     lock so a dictation that started since the monitor's unlocked peek wins."""
     global worker_conn, worker_proc
     with _worker_spawn_lock:
+        if IDLE_UNLOAD_SEC <= 0 or time.time() - _last_activity < IDLE_UNLOAD_SEC:
+            return
         if (state["recording"] or state["busy"] or state["continuous"]
                 or session is not None):
             return
@@ -833,10 +894,87 @@ def idle_monitor():
 # even when a dictation is cancelled mid-flight (we finish the in-flight recv,
 # then just discard the result).
 # ----------------------------------------------------------------------------
+def join_tail_context(previous, revised):
+    """Replace only a uniquely matching ending, otherwise request full context.
+
+    The new decode starts with four seconds already recognized. Require three
+    exact words as an anchor near the old ending; never guess through a mismatch
+    or an ambiguous repetition. Text after the anchor comes from the new decode.
+    """
+    old = list(re.finditer(r"\w+", previous))
+    new = list(re.finditer(r"\w+", revised))
+    if len(old) < 3 or len(new) < 3:
+        return None
+    old_words = [m.group().casefold() for m in old]
+    new_words = [m.group().casefold() for m in new]
+    for start in range(min(3, len(new)-2)):
+        anchor = new_words[start:start+3]
+        hits = [i for i in range(max(0,len(old)-16),len(old)-2)
+                if old_words[i:i+3] == anchor]
+        if len(hits) == 1:
+            return previous[:old[hits[0]].start()] + revised[new[start].start():]
+    return None
+
+
+def join_chunk_context(previous, revised):
+    """Split a contextual decode without replacing any previously heard words.
+
+    Match a unique spoken suffix, including every word through the old ending.
+    Only its final punctuation may change. Ambiguous repetitions, changed
+    words, quoted endings and missing continuations use independent decoding.
+    """
+    old = list(re.finditer(r"\w+", previous))
+    new = list(re.finditer(r"\w+", revised))
+    if len(old) < 3 or len(new) < 4:
+        return None
+    if not re.fullmatch(r"[\s,.!?;:]*", previous[old[-1].end():]):
+        return None
+    ow = [m.group().casefold() for m in old]
+    nw = [m.group().casefold() for m in new]
+    for start in range(min(3, len(new)-3)):
+        anchor = nw[start:start+3]
+        hits = [i for i in range(len(ow)-2) if ow[i:i+3] == anchor]
+        if len(hits) != 1 or hits[0] < max(0, len(ow)-16):
+            continue
+        # A repeat later in the new audio is new speech, not an ambiguous
+        # look-behind match. Only competing matches at the start are ambiguous.
+        if sum(nw[i:i+3] == anchor for i in range(min(3, len(nw)-2))) != 1:
+            continue
+        suffix = ow[hits[0]:]
+        end = start + len(suffix)
+        if end >= len(nw) or nw[start:end] != suffix:
+            continue
+        punctuation = revised[new[end-1].end():new[end].start()]
+        if not re.fullmatch(r"[\s,.!?;:]*", punctuation):
+            continue
+        return (previous[:old[-1].end()] + punctuation.rstrip(),
+                revised[new[end].start():])
+    return None
+
+
 class AsrSession:
-    def __init__(self, conn, lock):
+    def __init__(self, conn, lock, context_seconds=None):
         self.conn = conn
         self.lock = lock
+        self.id = uuid.uuid4().hex
+        self.frames = []
+        self.frames_lock = threading.Lock()
+        self.capture_error = False
+        self.capture_delay = 0.0
+        self.level = 0.0
+        self.device = "Microphone"
+        self.continuous = state.get("continuous", False)
+        if context_seconds is None:
+            context_seconds = (4 if IS_LINUX and app_store
+                               and app_store.settings["speech_model"] == "cohere-transcribe-en"
+                               else 0)
+        self.context_samples = (0 if self.continuous else
+                                int(min(4, max(0, context_seconds)) * SAMPLE_RATE))
+        self.voice_commands = bool(app_store and app_store.settings["voice_commands"])
+        self.errors = {}
+        self.audio_by_index = {}
+        self._worker_failed = False
+        self.started = time.monotonic()
         cm = state.get("continuous", False)
         # Continuous mode cuts far more eagerly so inline commands ("send")
         # complete within a beat of being spoken. max_seg must stay generous
@@ -847,9 +985,11 @@ class AsrSession:
             max_seg=10.0 if cm else MAX_SEG,
             silence_cut=0.35 if cm else SILENCE_CUT,
             keep_sil=0.1 if cm else KEEP_SIL,
+            boundary_window=0 if cm else BOUNDARY_WINDOW,
         )
         self.seg_q: "queue.Queue" = queue.Queue()
         self.results = {}          # index -> transcribed text
+        self.live_edit = None
         self.cancelled = False
         self._cmd_action = None    # set by feeder when a command is detected inline
         self._submitted = 0
@@ -865,10 +1005,13 @@ class AsrSession:
                                         name="asr-feeder", daemon=True)
         self._feeder.start()
 
-    def submit(self, audio):
-        idx = self._submitted
-        self._submitted += 1
-        self.seg_q.put((idx, audio))
+    def submit(self, audio, replace_index=None, tail_context=None):
+        idx = self._submitted if replace_index is None else replace_index
+        if replace_index is None:
+            self._submitted += 1
+        self.audio_by_index[idx] = audio
+        self.errors.pop(idx, None)
+        self.seg_q.put((idx, audio, tail_context))
         return idx
 
     def close(self):
@@ -877,6 +1020,8 @@ class AsrSession:
     def cancel(self):
         self.cancelled = True
         self._feeding = False
+        if self.live_edit:
+            self.live_edit.close()
 
     def join_consumer(self, timeout=None):
         self._consumer.join(timeout)
@@ -884,6 +1029,20 @@ class AsrSession:
     def ordered_texts(self):
         return [self.results[i] for i in range(self._submitted)
                 if self.results.get(i)]
+
+    def queue_edit(self, text=None):
+        if (self.cancelled or self.continuous or self.errors or self.capture_error
+                or not app_store or not app_store.settings["light_edit"] or not prompt_editor):
+            return
+        if text is None:
+            text = apply_dictionary(" ".join(self.ordered_texts()).strip())
+            if app_store.settings["cleanup"]:
+                text = clean_text(text)
+        if not text:
+            return
+        if self.live_edit is None:
+            self.live_edit = LiveEdit(prompt_editor)
+        self.live_edit.update(text)
 
     def _feed(self):
         # Poll the shared frames buffer rather than doing DSP in the mic
@@ -894,7 +1053,7 @@ class AsrSession:
             time.sleep(0.05)
 
     def _check_inline_cmd(self):
-        if not state.get("continuous"):
+        if not self.continuous or not self.voice_commands or self.cancelled:
             return
         texts = [self.results.get(i)
                  for i in range(self._submitted) if self.results.get(i)]
@@ -906,12 +1065,12 @@ class AsrSession:
             log.info("inline command detected: %s (text: %r)", cmd, test_text)
             self._cmd_action = cmd
             self._feeding = False
-            ui_q.put(("inline_cmd",))
+            ui_q.put(("inline_cmd", self.id))
 
     def _drain_frames(self):
-        with frames_lock:
-            new = frames[self._cursor:]
-            self._cursor = len(frames)
+        with self.frames_lock:
+            new = self.frames[self._cursor:]
+            self._cursor = len(self.frames)
         for block in new:
             for seg in self.segmenter.push(block):
                 if seg.size:
@@ -922,11 +1081,26 @@ class AsrSession:
         the Segmenter's tail so nothing the user said is left unqueued."""
         self._feeding = False
         if self._feeder is not None:
-            self._feeder.join(timeout=2.0)
+            self._feeder.join(timeout=10.0)
+            if self._feeder.is_alive():
+                raise TimeoutError("Audio feeder did not finish")
         self._drain_frames()
         tail = self.segmenter.finalize()
         if tail is not None and tail.size:
-            self.submit(tail)
+            # Short endings need preceding words, including the 1.6-second
+            # ending that returned empty in the reported take. Replace the
+            # preceding segment once; never append duplicate context text.
+            if tail.size < 3 * SAMPLE_RATE and self._submitted:
+                idx = self._submitted - 1
+                previous = self.audio_by_index[idx]
+                # Decode only the nearby ending first. The consumer falls back
+                # to the full previous chunk if it cannot align exact words.
+                context = previous[-4*SAMPLE_RATE:]
+                log.info("final tail: %.2fs with %.2fs preceding context", tail.size/SAMPLE_RATE, context.size/SAMPLE_RATE)
+                self.submit(np.concatenate([context, tail]), replace_index=idx,
+                            tail_context=(previous, tail))
+            else:
+                self.submit(tail)
 
     def _consume(self):
         while True:
@@ -937,30 +1111,141 @@ class AsrSession:
                 # Cancelled before this one was sent: nothing is in flight, so
                 # the pipe stays in sync. Just drop it.
                 continue
-            idx, audio = item
+            idx, audio, tail_context = item
+            self.errors.pop(idx, None)
+            if self._worker_failed:
+                self.errors[idx] = "Speech worker unavailable"
+                continue
             # After an idle unload the respawned worker may still be loading.
             # Hold the segment here until it reports ready — recording and
             # segmentation upstream never notice the wait.
-            if not worker_ready_evt.wait(timeout=WORKER_READY_WAIT):
-                log.error("segment %d dropped: worker not ready after %.0fs",
-                          idx, WORKER_READY_WAIT)
+            deadline = time.monotonic() + WORKER_READY_WAIT
+            while not worker_ready_evt.wait(timeout=0.1):
+                if self.cancelled:
+                    break
+                if time.monotonic() >= deadline:
+                    self.errors[idx] = "Speech model did not become ready"
+                    self._worker_failed = True
+                    break
+            if self.cancelled or idx in self.errors:
                 continue
             t0 = time.time()
             try:
-                with self.lock:
-                    self.conn.send(("recognize", audio, SAMPLE_RATE))
-                    kind, payload = self.conn.recv()
-            except Exception:
-                log.exception("asr consumer roundtrip failed")
-                continue
-            if kind == "text":
-                text = payload or ""
+                # A thinking pause can cut the audio without ending a sentence.
+                # Rehear a bounded suffix with the next chunk; no second model
+                # or whole-recording pass is needed. Keep the actual pause.
+                previous_update = None
+                previous_text = self.results.get(idx-1, "")
+                context = (self.audio_by_index[idx-1][-self.context_samples:]
+                           if self.context_samples and tail_context is None
+                           and previous_text and idx-1 in self.audio_by_index else None)
+                decode_audio = np.concatenate([context, audio]) if context is not None else audio
+                kind, payload = recognize_request(self.conn, self.lock, decode_audio)
+                if kind != "text":
+                    raise RuntimeError(str(payload))
+                text = (payload or "").strip()
+                if self.cancelled:
+                    continue
+                if context is not None:
+                    joined = join_chunk_context(previous_text, text)
+                    if joined is None:
+                        log.info("chunk context: no safe alignment; decoding current chunk independently")
+                        kind, payload = recognize_request(self.conn, self.lock, audio)
+                        if kind != "text":
+                            raise RuntimeError(str(payload))
+                        text = (payload or "").strip()
+                    else:
+                        previous_update, text = joined
+                        log.info("chunk context: aligned preceding words")
+                if tail_context is not None:
+                    joined = join_tail_context(self.results.get(idx, ""), text)
+                    if joined is None:
+                        log.info("tail context has no unique anchor; decoding complete preceding chunk")
+                        audio = np.concatenate(tail_context)
+                        kind, payload = recognize_request(self.conn, self.lock, audio)
+                        if kind != "text":
+                            raise RuntimeError(str(payload))
+                        text = (payload or "").strip()
+                    else:
+                        text = joined
+                # A retry with quiet right context helps an abruptly ended word.
+                frame_size = SAMPLE_RATE * FRAME_MS // 1000
+                nframes = audio.size // frame_size
+                level_frames = (np.sqrt(np.mean(audio[:nframes*frame_size].reshape(nframes,frame_size)**2,axis=1))
+                                if nframes else np.zeros(0))
+                # A nonzero microphone noise floor is not evidence of speech.
+                # Require several frames above the calibrated speech threshold.
+                voiced = np.count_nonzero(level_frames > max(ABS_FLOOR,self.segmenter._floor*FLOOR_MULT)) >= 3
+                if not text and voiced:
+                    kind, payload = recognize_request(self.conn, self.lock,
+                        np.concatenate([audio, np.zeros(SAMPLE_RATE//4, dtype="float32")]))
+                    if kind != "text":
+                        raise RuntimeError(str(payload))
+                    text = (payload or "").strip()
+                    if not text:
+                        self.errors[idx] = "A voiced segment returned no words"
                 log.info("segment %d: %.1fs audio -> %d chars in %.1fs",
-                         idx, len(audio) / SAMPLE_RATE, len(text), time.time() - t0)
+                         idx, len(audio)/SAMPLE_RATE, len(text), time.time()-t0)
                 if not self.cancelled:
-                    self.results[idx] = text
-            else:
-                log.info("segment %d: ASR error: %s", idx, payload)
+                    updates = {idx: text}
+                    if previous_update is not None:
+                        updates[idx-1] = previous_update
+                    self.results.update(updates)
+                    try:
+                        self.queue_edit()
+                    except Exception:
+                        # Optional polish must never turn valid ASR into an
+                        # incomplete take or retire the speech worker.
+                        log.exception("could not schedule background edit")
+            except Exception as exc:
+                self.errors[idx] = str(exc)
+                self._worker_failed = True
+                log.exception("ASR segment %d failed", idx)
+
+
+def retire_worker(conn):
+    """Retire only the failed generation, never a replacement or another task."""
+    global worker_conn, worker_proc
+    with _worker_spawn_lock:
+        if conn is not worker_conn:
+            return
+        state["model_ready"] = False
+        worker_ready_evt.clear()
+        if worker_proc is not None and worker_proc.is_alive():
+            worker_proc.terminate()
+            worker_proc.join(timeout=2)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        worker_conn = None
+        worker_proc = None
+
+
+def recognize_request(conn, lock, audio):
+    """Bound send as well as recv. The helper owns its pipe exchange until done.
+
+    On timeout the entire worker generation is retired: no future session can
+    consume a late response as if it belonged to another recording.
+    """
+    result = queue.Queue(maxsize=1)
+    def exchange():
+        try:
+            with lock:
+                conn.send(("recognize", audio, SAMPLE_RATE))
+                result.put((True, conn.recv()))
+        except Exception as exc:
+            result.put((False, exc))
+    threading.Thread(target=exchange, name="asr-exchange", daemon=True).start()
+    try:
+        ok, payload = result.get(timeout=ASR_TIMEOUT)
+    except queue.Empty:
+        retire_worker(conn)
+        raise TimeoutError("Speech model stopped responding") from None
+    if not ok:
+        retire_worker(conn)
+        raise payload
+    return payload
 
 
 def acquire_single_instance():
@@ -997,11 +1282,12 @@ def _resolve_input_device(sd):
     than raised: falling back to the default mic is a better failure than not
     recording at all.
     """
-    if not INPUT_DEVICE:
+    choice = app_store.settings["input_device"] if app_store and "input_device" in app_store.settings else INPUT_DEVICE
+    if not choice:
         return None
-    if INPUT_DEVICE.isdigit():
-        return int(INPUT_DEVICE)
-    needle = INPUT_DEVICE.lower()
+    if choice.isdigit():
+        return int(choice)
+    needle = choice.lower()
     try:
         for idx, dev in enumerate(sd.query_devices()):
             if dev.get("max_input_channels", 0) > 0 and needle in dev["name"].lower():
@@ -1048,7 +1334,7 @@ def _reinit_portaudio(sd):
 
 
 def start_recording():
-    global stream, frames, session
+    global stream, frames, session, active_take_id
     import sounddevice as sd
 
     if state["recording"] or state["busy"]:
@@ -1057,18 +1343,35 @@ def start_recording():
     # session wires itself to worker_conn. This returns as soon as the process
     # exists — the mic opens right away and the reload (~4 s) is paid in this
     # dictation's paste latency, not in lost audio.
-    ensure_worker()
+    state["busy"] = True  # Claim the worker before the idle monitor can unload it.
+    try:
+        ensure_worker()
+    except Exception:
+        state["busy"] = False
+        log.exception("could not start speech worker")
+        ui_q.put(("status", "Could not start the speech model"))
+        return
     touch_activity()
     with frames_lock:
         frames = []
     # Spin up the streaming session BEFORE the mic opens, so its feeder starts
     # transcribing speech in the background the moment audio arrives.
     session = AsrSession(worker_conn, worker_lock)
+    active_take_id = session.id
     session.start_feeder()
+    capture = session
+    frames = capture.frames
 
     def cb(indata, n, t, status):
-        with frames_lock:
-            frames.append(indata.copy())
+        with capture.frames_lock:
+            capture.frames.append(indata.copy())
+        # Standard deviation rejects this microphone's DC bias. No Python DSP loop
+        # or UI work in PortAudio's real-time callback.
+        capture.level = float(np.std(indata))
+        capture.capture_delay = max(0.0, t.currentTime - t.inputBufferAdcTime - n/SAMPLE_RATE)
+        if status:
+            capture.capture_error = True
+            log.warning("audio capture discontinuity: %s", status)
 
     def _open():
         # Resolve the device inside the retry, not outside it: after a
@@ -1077,7 +1380,11 @@ def start_recording():
         device = _resolve_input_device(sd)
         s = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
                            dtype="float32", callback=cb, device=device)
-        s.start()
+        try:
+            s.start()
+        except Exception:
+            s.close()
+            raise
         return s
 
     try:
@@ -1095,129 +1402,194 @@ def start_recording():
         # empty the first question is always "which microphone was that?", and
         # answering it from the log beats guessing from the audio server's
         # current state minutes later.
-        log.info("input device: %s", _describe_input_device(sd, stream))
+        capture.device = _describe_input_device(sd, stream)
+        log.info("input device: %s", capture.device)
     except Exception as e:
         log.exception("mic open failed")
         session.cancel()
         session.close()
         session = None
-        ui_q.put(("status", f"mic error: {e}"))
-        threading.Timer(1.8, lambda: ui_q.put(("hide",))).start()
+        state["busy"] = False
+        state["continuous"] = False
+        ui_q.put(("status", "No microphone available — open Settings"))
         return
     state["recording"] = True
+    state["busy"] = False
     log.info("recording started")
     ui_q.put(("listen",) if state["continuous"] else ("show",))
 
 
 def stop_and_transcribe():
-    global stream, session
-
-    if not state["recording"]:
+    global stream
+    if not state["recording"] or session is None:
         return
-    # Stop-to-paste is measured from HERE (the stop hotkey) to just after the
-    # paste lands — that is the latency the user actually feels.
-    t_stop = time.time()
+    sess = session
     state["recording"] = False
+    state["busy"] = True
+    log.info("stop requested: buffered capture delay %.3fs", sess.capture_delay)
     try:
         stream.stop()
         stream.close()
     except Exception:
-        pass
+        sess.capture_error = True
+        log.exception("microphone close failed")
     stream = None
-    # Keep the whole take around: it is the safety fallback if streaming
-    # produced no segments (very short or very quiet dictation).
-    with frames_lock:
-        data = np.concatenate(frames) if frames else np.zeros((0, 1), dtype="float32")
-    audio = remove_dc(data.reshape(-1).astype("float32"))
-    log.info("recording stopped: %.1fs audio", audio.size / SAMPLE_RATE)
-    if audio.size < SAMPLE_RATE * MIN_SECONDS:
-        if session is not None:
-            session.cancel()
-            session.close()
+    ui_q.put(("processing", sess.id))
+    threading.Thread(target=_finish_take, args=(sess,), name="finish-take", daemon=True).start()
+
+
+def prepare_paste(sess, text):
+    """Publish the native clipboard and unmap the capsule on its GUI thread."""
+    if not IS_LINUX or overlay is None:
+        return False
+    hidden = threading.Event()
+    copied = []
+    ui_q.put(("prepare_paste", sess.id, hidden, text, copied))
+    deadline = time.monotonic() + 2
+    while not hidden.wait(.05):
+        if sess.cancelled:
+            return False
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Recording capsule did not finish clipboard handoff")
+    return bool(copied and copied[0])
+
+
+def _finish_take(sess):
+    global session, last_retry
+    t_stop = time.monotonic()
+    outcome = "error"
+    message = "Recognition did not finish"
+    audio = np.zeros(0, dtype="float32")
+    out = raw = ""
+    take_id = None
+    try:
+        sess.stop_feeding()
+        sess.close()
+        sess.join_consumer(timeout=ASR_TIMEOUT + WORKER_READY_WAIT + 5)
+        log.info("final recognition wait: %.3fs", time.monotonic()-t_stop)
+        if sess._consumer.is_alive():
+            retire_worker(sess.conn)
+            raise TimeoutError("Recognition did not finish in time")
+        if sess.cancelled:
+            return
+        with sess.frames_lock:
+            audio = remove_dc(np.concatenate(sess.frames).reshape(-1)) if sess.frames else audio
+        duration = audio.size / SAMPLE_RATE
+        log.info("recording stopped: %.1fs audio", duration)
+        if duration < MIN_SECONDS:
+            outcome, message = "idle", "Recording cancelled"
+            return
+        texts = sess.ordered_texts()
+        # If no segment produced text, retry the full captured take with context.
+        if not texts and not sess.errors:
+            if not worker_ready_evt.wait(timeout=WORKER_READY_WAIT):
+                raise TimeoutError("Speech model is not ready")
+            kind, payload = recognize_request(sess.conn, sess.lock, audio)
+            if kind != "text":
+                raise RuntimeError(str(payload))
+            texts = [payload] if payload else []
+        raw = " ".join(texts).strip()
+        log.info("raw ASR text: %r", raw)
+        joined = apply_dictionary(raw)
+        cmd = None
+        # Session mode is immutable. Revalidate after the tail: never reinstate
+        # an earlier inline command contradicted by later speech.
+        if sess.continuous and sess.voice_commands and not sess.errors:
+            joined, cmd = detect_and_strip_command(joined)
+        cleanup = app_store.settings["cleanup"] if app_store else CLEANUP
+        out = clean_text(joined) if cleanup else joined
+        if sess.cancelled:
+            return
+        incomplete = bool(sess.errors) or sess.capture_error
+        edit_requested = bool(out and not incomplete and not sess.continuous
+                              and app_store and app_store.settings["light_edit"] and prompt_editor)
+        status = "incomplete" if incomplete else "editing" if edit_requested else "ready"
+        if app_store and (out or incomplete):
+            take_id = app_store.add(out, raw, duration, status)
+        if edit_requested:
+            ui_q.put(("editing", sess.id))
+            try:
+                sess.queue_edit(out)
+                edited = sess.live_edit.finish(out, cancelled=lambda: sess.cancelled)
+                log.info("light edit: %s; stop wait %.3fs", edited.reason, edited.seconds)
+                out = edited.text
+            except Exception:
+                log.exception("light edit failed; retaining transcript")
+            if sess.cancelled:
+                app_store.mark(take_id, "cancelled")
+                return
+            app_store.finish_edit(take_id, out)
+            status = "ready"
+        if out:
+            save_transcript(out)
+        if incomplete:
+            last_retry = (take_id, audio.copy())
+            if out and IS_LINUX:
+                linux_backend.copy_to_clipboard(out)
+            outcome, message = "error", "Recognition interrupted"
+            return  # A partial take must not silently paste or send.
+        if not out and not cmd:
+            outcome, message = "error", "No sound detected" if float(np.std(audio)) <= ABS_FLOOR else "No words recognised"
+            if app_store and take_id is None:
+                take_id=app_store.add("",raw,duration,"no_speech")
+            last_retry = (take_id, audio.copy())
+            return
+        if sess.cancelled:
+            return
+        if out:
+            clipboard_ready = prepare_paste(sess, out)
+            result = paste_text(out, cancelled=lambda:sess.cancelled, clipboard_ready=clipboard_ready)
+            status = result.status
+            if app_store:
+                app_store.mark(take_id, status)
+            outcome = "inserted" if result.status in ("inserted", "dispatched") else "recover"
+            message = "Inserted" if result.confirmed else result.message
+            if cmd and result.confirmed and not sess.cancelled:
+                press_command_key(cmd)
+        elif cmd:
+            press_command_key(cmd)
+            outcome, message = "inserted", "Command sent"
+        log.info("stop-to-delivery: %.1fs (%d chars, %s)", time.monotonic()-t_stop,len(out),status if out else outcome)
+    except Exception as exc:
+        log.exception("stop/transcribe failed")
+        message = "Recognition interrupted"
+        if not sess.cancelled:
+            if not audio.size:
+                with sess.frames_lock:
+                    audio = remove_dc(np.concatenate(sess.frames).reshape(-1)) if sess.frames else audio
+            if app_store and take_id is None:
+                take_id=app_store.add(out,raw,audio.size/SAMPLE_RATE,"incomplete")
+            last_retry=(take_id,audio.copy())
+    finally:
+        if sess.live_edit:
+            sess.live_edit.close()
+        if session is sess:
             session = None
-        if state["continuous"]:
-            ui_q.put(("restart",))
-        else:
-            ui_q.put(("hide",))
+            state["busy"] = False
+            touch_activity()
+            if not sess.cancelled:
+                ui_q.put(("outcome", sess.id, outcome, message))
+                if state["continuous"] and outcome == "inserted":
+                    ui_q.put(("restart",))
+                elif outcome in ("error","recover"):
+                    state["continuous"] = False
+
+
+def retry_audio(take_id):
+    global session, active_take_id
+    if state["recording"] or state["busy"]:
+        return
+    if last_retry is None or last_retry[0] != take_id:
+        ui_q.put(("status", "Audio retry is available for the last incomplete take only"))
         return
     state["busy"] = True
-    ui_q.put(("processing",))
-    sess = session
-
-    def work():
-        global session
-        try:
-            # Flush the tail through the segmenter, close the queue, and wait for
-            # the consumer to finish. Mid-recording segments are already done, so
-            # this wait is only the (short) tail — that is the whole win.
-            sess.stop_feeding()
-            sess.close()
-            sess.join_consumer()
-            if sess.cancelled:
-                return
-            texts = sess.ordered_texts()
-            if not texts:
-                # Nothing got segmented: fall back to exactly today's behaviour
-                # and transcribe the whole take once. Same ready-gate as the
-                # consumer: a respawned worker may still be loading.
-                worker_ready_evt.wait(timeout=WORKER_READY_WAIT)
-                with worker_lock:
-                    worker_conn.send(("recognize", audio, SAMPLE_RATE))
-                    kind, payload = worker_conn.recv()
-                joined = (payload or "").strip() if kind == "text" else ""
-                n_segments = 1
-            else:
-                joined = " ".join(texts)
-                n_segments = len(texts)
-            # Personal dictionary fixes the model's known misfires (names,
-            # brands) on the joined text BEFORE clean_text. Both the segmented
-            # and the whole-take fallback path funnel through `joined`, so this
-            # one call covers them both. The raw line makes "did the model even
-            # transcribe that word or did a correction eat it" answerable from
-            # the log alone (local file, same privacy as transcripts.log).
-            log.info("raw ASR text: %r", joined)
-            joined = apply_dictionary(joined)
-            # Command words are a continuous-mode feature only — see the note
-            # at _SEND_RX for why they must never fire on one-shot dictations.
-            if state["continuous"]:
-                joined, cmd = detect_and_strip_command(joined)
-            else:
-                cmd = None
-            if cmd:
-                log.info("command detected: %s", cmd)
-            # clean_text runs ONCE on the joined text, so filler/dup collapsing
-            # works across segment boundaries just like the single-shot path did.
-            out = clean_text(joined) if CLEANUP else joined
-            log.info("ASR result: %d chars -> %d after cleanup",
-                     len(joined), len(out))
-            if out:
-                save_transcript(out)
-                paste_text(out)
-            else:
-                # An empty transcript used to fall through here in total silence:
-                # nothing pasted, nothing written to transcripts.log, no message
-                # on screen. To the user that is indistinguishable from a broken
-                # paste, and it sent us hunting through the delivery path when
-                # the real fault was upstream of it. Say which one it is.
-                report_empty_transcript(audio)
-            if cmd:
-                press_command_key(cmd)
-            log.info("stop-to-paste: %.1fs (%d segments, %d chars)",
-                     time.time() - t_stop, n_segments, len(out))
-        except Exception as e:
-            log.exception("stop/transcribe failed")
-            ui_q.put(("status", f"error: {e}"))
-            time.sleep(1.8)
-        finally:
-            state["busy"] = False
-            session = None
-            touch_activity()   # idle countdown starts when the work ends
-            if state["continuous"]:
-                ui_q.put(("restart",))
-            else:
-                ui_q.put(("hide",))
-
-    threading.Thread(target=work, daemon=True).start()
+    ensure_worker()
+    sess = AsrSession(worker_conn,worker_lock)
+    sess.frames = [last_retry[1].copy()]
+    session = sess
+    active_take_id = sess.id
+    ui_q.put(("processing", sess.id))
+    threading.Thread(target=_finish_take,args=(sess,),daemon=True).start()
 
 
 def report_empty_transcript(audio):
@@ -1271,17 +1643,19 @@ def save_transcript(text):
         log.exception("could not save transcript history")
 
 
-def paste_text(text):
+def paste_text(text, cancelled=lambda:False, clipboard_ready=False):
     if IS_LINUX:
-        linux_backend.paste_text(text)
-        return
+        return linux_backend.paste_text(text, shortcut=app_store.settings["paste_shortcut"] if app_store else "ctrl+v",cancelled=cancelled,clipboard_ready=clipboard_ready)
 
     import keyboard
     import pyperclip
 
     pyperclip.copy(text)
     time.sleep(0.06)
+    if cancelled():
+        return linux_backend.DeliveryResult("cancelled", "Cancelled")
     keyboard.send("ctrl+v")
+    return linux_backend.DeliveryResult("uncertain", "Ready to paste · insertion not confirmed")
     # The transcription deliberately STAYS in the clipboard, so if the paste
     # went to the wrong window (or nowhere), Ctrl+V drops it anywhere you like.
 
@@ -1308,7 +1682,7 @@ def toggle():
         return
     if not model_available():
         ui_q.put(("status", "Model still loading…"))
-        threading.Timer(1.5, lambda: ui_q.put(("hide",))).start()
+
         return
     if state["recording"]:
         stop_and_transcribe()
@@ -1341,7 +1715,8 @@ def restart_if_continuous():
 
 
 def detect_and_strip_command(text):
-    m = _NUM_RX.search(text)
+    text = text.strip()
+    m = _NUM_RX.fullmatch(text)
     if m:
         word = m.group(1).lower()
         return text[:m.start()].rstrip(), _NUMBER_MAP[word]
@@ -1351,85 +1726,35 @@ def detect_and_strip_command(text):
     return text, None
 
 
-def handle_inline_command():
-    global stream, session
-    if not state["recording"] or session is None:
+def handle_inline_command(session_id=None):
+    if session is None or (session_id is not None and session.id != session_id):
         return
-    sess = session
-    state["recording"] = False
-    try:
-        stream.stop()
-        stream.close()
-    except Exception:
-        pass
-    stream = None
-    state["busy"] = True
-    ui_q.put(("processing",))
-
-    def work():
-        global session
-        try:
-            sess.stop_feeding()
-            sess.close()
-            sess.join_consumer()
-            if sess.cancelled:
-                return
-            joined = " ".join(sess.ordered_texts()).strip()
-            if not joined:
-                return
-            log.info("inline raw ASR: %r", joined)
-            joined = apply_dictionary(joined)
-            joined, cmd = detect_and_strip_command(joined)
-            if cmd is None:
-                # The feeder heard the command, but the flushed tail added
-                # words after it, so the end-anchored re-check missed. The
-                # mode already committed (mic is stopped) — honor what the
-                # feeder detected rather than leave the action half-fired.
-                cmd = sess._cmd_action
-            if cmd:
-                log.info("inline command: %s (text: %r)", cmd, joined)
-            out = clean_text(joined) if CLEANUP else joined
-            if out:
-                save_transcript(out)
-                paste_text(out)
-            if cmd:
-                press_command_key(cmd)
-        except Exception:
-            log.exception("inline command handler failed")
-        finally:
-            state["busy"] = False
-            session = None
-            touch_activity()   # idle countdown starts when the work ends
-            if state["continuous"]:
-                ui_q.put(("restart",))
-            else:
-                ui_q.put(("hide",))
-
-    threading.Thread(target=work, daemon=True).start()
+    stop_and_transcribe()
 
 
 def cancel():
-    global stream, session
+    global stream, session, active_take_id
+    active_take_id = None
+    state["continuous"] = False
+    sess = session
+    if sess is None:
+        ui_q.put(("hide",))
+        return
+    sess.cancel()
     if state["recording"]:
-        state["recording"] = False
         try:
             stream.stop()
             stream.close()
         except Exception:
-            pass
-        stream = None
-        # Mark the session cancelled: its consumer keeps the pipe in sync but
-        # discards results, nothing is pasted, no transcript is saved.
-        if session is not None:
-            session.cancel()
-            session.close()
-            session = None
-        touch_activity()
-        log.info("recording cancelled")
-        if state["continuous"]:
-            ui_q.put(("restart",))
-        else:
-            ui_q.put(("hide",))
+            log.exception("microphone close during cancel failed")
+        sess.close()
+    stream = None
+    session = None
+    state["recording"] = False
+    state["busy"] = False
+    touch_activity()
+    log.info("recording cancelled")
+    ui_q.put(("hide",))
 
 
 def quit_app():
@@ -1447,38 +1772,64 @@ def _lerp_hex(a, b, t):
 
 
 def pump_ui(ov):
-    """Drain the UI queue into whichever overlay is running.
-
-    Shared by both overlays. On Linux the chip is drawn by GTK (see
-    overlay_gtk.py — tk cannot do per-pixel transparency on X11); on Windows it
-    is still the tkinter one, which keeps its real `-transparentcolor` support.
-    Both expose the same show_pill / show_mini / hide / after / destroy surface,
-    so this dispatch does not need to know the difference.
-
-    Returns False when the app is quitting, so the caller stops rescheduling.
-    """
     try:
         while True:
             msg = ui_q.get_nowait()
             kind = msg[0]
-            if kind == "show":
-                ov.show_pill("Transcribing", "#ff5b6a", "recording")
-            elif kind == "listen":
-                ov.show_pill("Listening", "#ff5b6a", "recording")
+            if kind in ("processing", "editing", "inline_cmd", "outcome", "prepare_paste") and len(msg)>1:
+                if msg[1] != active_take_id:
+                    continue
+            if kind == "action":
+                actions = {"toggle": toggle, "continuous": toggle_continuous,
+                           "cancel": cancel, "quit": quit_app}
+                if msg[1] in actions:
+                    actions[msg[1]]()
+            elif kind in ("show", "listen"):
+                ov.show_pill("Listening" if kind=="show" else "Listening · hands-free", "#d8f58a", "recording")
             elif kind == "processing":
-                ov.show_pill("Transcribing", "#f5b23e", "processing")
+                ov.show_pill("Finishing your words", "#d8f58a", "processing")
+            elif kind == "editing":
+                ov.show_pill("Polishing your wording", "#d8f58a", "processing")
+            elif kind == "prepare_paste":
+                ov.hide()
+                def publish(handoff=msg):
+                    if handoff[1] != active_take_id:
+                        handoff[2].set()
+                        return
+                    try:
+                        handoff[4].append(bool(ov.copy_to_clipboard(handoff[3])) if hasattr(ov,"copy_to_clipboard") else False)
+                    except Exception:
+                        log.exception("Native clipboard handoff failed")
+                        handoff[4].append(False)
+                    finally:
+                        handoff[2].set()
+                ov.root.after(80, publish)
             elif kind == "loading":
-                ov.show_mini("#f5b23e")
+                if not state["model_ready"]:
+                    ov.show_mini("#d8f58a")
+            elif kind == "ready":
+                if not state["recording"] and not state["busy"]:
+                    ov.hide()
+                    if state["continuous"]:
+                        start_recording()
             elif kind == "status":
-                ov.show_pill(msg[1], "#f5b23e", "status")
+                ov.show_pill(msg[1], "#f4cc8a", "status")
+            elif kind == "outcome":
+                if msg[2] == "error":
+                    ov.show_pill(msg[3], "#f4cc8a", "status")
+                else:
+                    # Paste once, leave the text on the clipboard, disappear.
+                    # No confirmation screen or second user action is required.
+                    ov.hide()
             elif kind == "hide":
-                ov.hide()
+                if not state["recording"] and not state["busy"]:
+                    ov.hide()
             elif kind == "restart":
-                ov.hide()
                 ov.root.after(400, restart_if_continuous)
             elif kind == "inline_cmd":
-                handle_inline_command()
+                handle_inline_command(msg[1])
             elif kind == "quit":
+                cancel()
                 ov.root.destroy()
                 return False
     except queue.Empty:
@@ -1787,6 +2138,7 @@ class Overlay:
 
 
 def main():
+    global app_store, overlay, prompt_editor
     if not IS_LINUX:
         import tkinter as tk
         import keyboard
@@ -1800,16 +2152,32 @@ def main():
         # GNOME owns the key grab and pokes us over the lock socket, so the
         # single-instance port doubles as the command channel.
         linux_backend.serve_commands(_lock_sock, {
-            "toggle": toggle,
-            "toggle-continuous": toggle_continuous,
-            "cancel": cancel,
-            "quit": quit_app,
+            "toggle": lambda: ui_q.put(("action", "toggle")),
+            "toggle-continuous": lambda: ui_q.put(("action", "continuous")),
+            "cancel": lambda: ui_q.put(("action", "cancel")),
+            "quit": lambda: ui_q.put(("action", "quit")),
+            "status": lambda: json.dumps(dict(state, version=APP_VERSION, build=BUILD_ID,
+                                               model=SPEECH_MODELS[app_store.settings["speech_model"]] if app_store else MODEL_NAME,
+                                               cleanup=app_store.settings["cleanup"] if app_store else CLEANUP,
+                                               light_edit=bool(app_store and app_store.settings["light_edit"]),
+                                               editor=prompt_editor.state if prompt_editor else "disabled",
+                                               pid=os.getpid(), worker_pid=worker_proc.pid if worker_proc else None)),
         })
 
     # Make sure the editable dictionary.txt exists (first run drops the commented
     # template next to the exe / in the repo root) and load it now, so the rule
     # count is logged at startup and corrections are ready before the first
     # dictation. Later edits hot-reload on their own, no restart needed.
+    app_store = AppStore(BASE_DIR)
+    if app_store.settings["light_edit"]:
+        import atexit
+        from prompt_editor import PromptEditor
+        prompt_editor = PromptEditor(BASE_DIR)
+        atexit.register(prompt_editor.close)
+        prompt_editor.start()
+    if not app_store.settings_file.exists() and INPUT_DEVICE:
+        app_store.update("input_device", INPUT_DEVICE)
+    app_store.import_legacy(os.path.join(BASE_DIR,"transcripts.log"))
     ensure_dictionary_file()
     with _dict_lock:
         _maybe_reload()
@@ -1841,48 +2209,27 @@ def main():
     else:
         log.info("idle unload disabled (PARAKEET_IDLE_UNLOAD_SEC=0)")
 
-    # The GTK chip is opt-in (PARAKEET_GTK_OVERLAY=1) and NOT the default, which
-    # is a retreat and worth being precise about.
-    #
-    # It draws the better chip and that part is proven: a real ARGB visual, round
-    # corners, a blurred shadow, and over a fullscreen white window the pixels
-    # beside it read exactly (255,255,255) — something tk can never do on X11,
-    # where it has no per-pixel transparency and every "rounded" corner is a
-    # painted block.
-    #
-    # What is not solved is stacking INSIDE THIS APP. Run standalone the chip
-    # maps at +0+0 and draws on top of everything. Run from dictation.py the same
-    # code maps at +34+33 and never becomes visible: present in the window list,
-    # GLib timers firing, offset measured and compensated, draw handler wired —
-    # and nothing on screen. set_keep_above before the map, again after it,
-    # gdk raise_() after every focus restore, and a realized anchor toplevel to
-    # reproduce the standalone conditions all failed to change it. The window
-    # never gains the compositor's "above" flag, which pipsqueak gets from the
-    # same call.
-    #
-    # An invisible status chip is worse than an ugly one, so tk is the default
-    # until that is understood. See FINDINGS S-007.
-    if IS_LINUX and os.environ.get("PARAKEET_GTK_OVERLAY") == "1":
-        import overlay_gtk
-        ov = overlay_gtk.GtkOverlay()
-        root = ov
-        log.info("overlay: GTK3, rgba=%s font=%r scale=%.2f screen=%dx%d",
-                 ov.has_alpha, ov.font_family, ov.S, ov.sw, ov.sh)
-        ov.after(60, lambda: _gtk_poll(ov))
+    if IS_LINUX and os.environ.get("PARAKEET_LEGACY_UI") != "1":
+        from native_ui import NativeUI
+        def sample():
+            sess=session
+            return {"level": sess.level if sess else 0,
+                    "device": sess.device if sess else "Microphone off",
+                    "continuous": state["continuous"]}
+        ov = NativeUI(app_store, {
+            "toggle": toggle, "cancel": cancel, "quit": quit_app,
+        }, sample)
+        root=ov
+        ov.after(60,lambda:_gtk_poll(ov))
+        log.info("overlay: native recording capsule")
     else:
         import tkinter as tk
-        root = tk.Tk()
+        root=tk.Tk()
         root.title("Parakeet Dictation")
-        ov = Overlay(root)
+        ov=Overlay(root)
+    overlay=ov
 
-    # Why the overlay hands focus straight back (see overlay_gtk._restore_focus):
-    # showing the chip maps a managed window, and mapping a managed window takes
-    # the keyboard here regardless of accept_focus / focus_on_map. Dictation
-    # pastes into whatever is focused, so a chip that keeps focus would send
-    # every dictation into an invisible window.
-    if model_cached:
-        ui_q.put(("loading",))
-    else:
+    if not model_cached and app_store.settings["speech_model"] == "parakeet":
         # The normal ("hide",) on worker-ready clears this once the download and
         # load finish.
         ui_q.put(("status", "Downloading speech model (one time, ~460 MB)"))
@@ -1907,9 +2254,9 @@ def main():
 
     def fire_combo():
         if combo["shift_seen"] or "shift" in keys_down:
-            toggle_continuous()
+            ui_q.put(("action", "continuous"))
         else:
-            toggle()
+            ui_q.put(("action", "toggle"))
 
     def norm(name):
         n = (name or "").lower()
@@ -1930,8 +2277,7 @@ def main():
         if e.event_type == "down":
             keys_down.add(k)
             if k == "esc":
-                if state["recording"]:
-                    cancel()
+                ui_q.put(("action", "cancel"))
                 return
             if "ctrl" in keys_down and "alt" in keys_down and k == "q":
                 quit_app()
@@ -1954,21 +2300,18 @@ def main():
     else:
         log.info("linux: hotkeys served by GNOME via the command channel")
     log.info("entering mainloop")
-    root.mainloop()
     try:
-        with worker_lock:
-            if worker_conn is not None:   # idle unload may have taken it down
-                worker_conn.send(("quit", None))
-    except Exception:
-        pass
+        root.mainloop()
+    finally:
+        if prompt_editor is not None:
+            prompt_editor.close()
+        if worker_conn is not None:
+            retire_worker(worker_conn)
+        if _lock_sock is not None:
+            _lock_sock.close()
     log.info("mainloop exited")
 
 
 if __name__ == "__main__":
     mp.freeze_support()
-    # `--send <cmd>` is the client half of the Linux hotkey path: GNOME binds a
-    # key to it, it pokes the running app and exits. Handled before anything
-    # heavy is imported so the keypress round-trip stays in the low ms.
-    if len(sys.argv) >= 3 and sys.argv[1] == "--send":
-        sys.exit(linux_backend.send_command(sys.argv[2]))
     main()

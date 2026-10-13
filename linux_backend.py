@@ -46,8 +46,20 @@ import socket
 import subprocess
 import threading
 import time
+import json
+from dataclasses import dataclass
 
 log = logging.getLogger("dictation")
+
+
+@dataclass(frozen=True)
+class DeliveryResult:
+    status: str
+    message: str
+
+    @property
+    def confirmed(self):
+        return self.status == "inserted"
 
 LOCK_HOST, LOCK_PORT = "127.0.0.1", 49731
 
@@ -214,24 +226,129 @@ def _atspi_insert(text: str) -> bool:
         return False
 
 
-def paste_text(text: str) -> None:
+def _wait_modifiers(timeout=1.5):
+    """Wait for the user's shortcut to be released; never release their keys.
+
+    GDK's keymap state is the available XWayland modifier view. If unavailable,
+    fail closed to clipboard recovery instead of injecting a contaminated chord.
+    """
+    try:
+        import gi
+        gi.require_version("Gdk", "3.0")
+        from gi.repository import Gdk
+        display=Gdk.Display.get_default()
+        if display is None:
+            return False
+        keymap=Gdk.Keymap.get_for_display(display)
+        mask=(Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK |
+              Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.SUPER_MASK)
+        deadline=time.monotonic()+timeout
+        while keymap.get_modifier_state() & mask:
+            if time.monotonic()>=deadline:
+                return False
+            time.sleep(.025)
+        return True
+    except Exception:
+        log.exception("could not check shortcut modifiers")
+        return False
+
+
+def _focused_snapshot():
+    """Optional exact before/after oracle for apps exposing EditableText."""
+    try:
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi
+        Atspi.init()
+        Atspi.set_timeout(150, 400)
+        desktop=Atspi.get_desktop(0)
+        deadline=time.monotonic()+.5
+        budget=600
+        def walk(node,depth):
+            nonlocal budget
+            budget-=1
+            if depth>24 or budget<0 or time.monotonic()>deadline:return None
+            try:
+                states=node.get_state_set()
+                if states.contains(Atspi.StateType.FOCUSED):
+                    iface=node.get_text_iface()
+                    if iface is not None and node.get_editable_text_iface() is not None:
+                        before=Atspi.Text.get_text(iface,0,-1)
+                        caret=Atspi.Text.get_caret_offset(iface)
+                        start=end=caret
+                        if Atspi.Text.get_n_selections(iface):
+                            selection=Atspi.Text.get_selection(iface,0)
+                            start,end=selection.start_offset,selection.end_offset
+                        return node,before,start,end
+                for i in range(min(node.get_child_count(),200)):
+                    child=node.get_child_at_index(i)
+                    if child is not None:
+                        hit=walk(child,depth+1)
+                        if hit:return hit
+            except Exception:return None
+            return None
+        for i in range(desktop.get_child_count()):
+            app=desktop.get_child_at_index(i)
+            if app is not None and app.get_name() not in ("gnome-shell",):
+                # Start at the active window, not the first application's entire
+                # tree: an unrelated large editor can otherwise eat the budget.
+                for j in range(app.get_child_count()):
+                    window=app.get_child_at_index(j)
+                    if window and window.get_state_set().contains(Atspi.StateType.ACTIVE):
+                        hit=walk(window,0)
+                        if hit:return hit
+    except Exception:
+        log.debug("No accessibility delivery oracle",exc_info=True)
+    return None
+
+
+def _insertion_matches(snapshot,text):
+    if snapshot is None:return False
+    node,before,start,end=snapshot
+    if start<0 or end<start:return False
+    try:
+        import gi
+        gi.require_version("Atspi","2.0")
+        from gi.repository import Atspi
+        after=Atspi.Text.get_text(node.get_text_iface(),0,-1)
+        return after==before[:start]+text+before[end:]
+    except Exception:return False
+
+
+def paste_text(text: str, shortcut="ctrl+v", cancelled=lambda:False, verify=False, clipboard_ready=False) -> DeliveryResult:
     # The clipboard is written first and deliberately left holding the text: it
     # is the user's manual recovery path if every automatic route below fails.
-    if not copy_to_clipboard(text):
-        return
+    if cancelled():
+        return DeliveryResult("cancelled", "Cancelled")
+    if not clipboard_ready and not copy_to_clipboard(text):
+        return DeliveryResult("clipboard_failed", "Could not copy text")
     # Give the compositor a moment to take ownership of the new selection before
     # the paste asks for it back; without this the target can read the *old*
     # clipboard. Same reason the Windows path sleeps here.
     time.sleep(0.12)
-    if _chord("ctrl", "v"):
-        return
+    if not _wait_modifiers():
+        return DeliveryResult("uncertain", "Ready to paste · release shortcut keys")
+    before=_focused_snapshot() if verify else None
+    if cancelled():
+        return DeliveryResult("cancelled", "Cancelled")
+    chord=("ctrl","shift","v") if shortcut=="ctrl+shift+v" else ("ctrl","v")
+    if _chord(*chord):
+        if not verify:
+            return DeliveryResult("dispatched", "Paste sent")
+        for _ in range(4):
+            time.sleep(.08)
+            if _insertion_matches(before,text):
+                return DeliveryResult("inserted", "Inserted")
+        return DeliveryResult("uncertain", "Ready to paste · insertion not confirmed")
     # Injection is unavailable (ydotoold down, or /dev/uinput out of reach).
     # AT-SPI needs no keyboard at all, so it can still land the text.
     log.warning("synthetic paste failed - trying AT-SPI")
-    if _atspi_insert(text):
-        return
+    # The old fallback inserted at a caret without replacing selected text and
+    # could verify an unrelated existing substring. Keep clipboard recovery when
+    # injection fails; don't perform another unobservable edit of another app.
     log.warning("delivery failed on every route - the text is on the clipboard, "
                 "paste it manually with Ctrl+V")
+    return DeliveryResult("failed", "Paste unavailable · text is on the clipboard")
 
 
 def press_command_key(cmd: str) -> None:
@@ -265,8 +382,8 @@ def serve_commands(sock, handlers: dict) -> None:
                 fn = handlers.get(cmd)
                 log.info("command channel: %r -> %s", cmd, "ok" if fn else "unknown")
                 if fn:
-                    fn()
-                    conn.sendall(b"ok\n")
+                    result=fn()
+                    conn.sendall((result+"\n").encode() if isinstance(result,str) else b"ok\n")
                 else:
                     conn.sendall(b"unknown\n")
             except Exception:
@@ -286,8 +403,11 @@ def send_command(cmd: str) -> int:
     try:
         with socket.create_connection((LOCK_HOST, LOCK_PORT), timeout=3) as s:
             s.sendall(cmd.encode("utf-8"))
-            reply = s.recv(32).decode("utf-8", "replace").strip()
+            reply = s.recv(4096).decode("utf-8", "replace").strip()
         if reply == "ok":
+            return 0
+        if cmd == "status" and reply.startswith("{"):
+            print(reply)
             return 0
         print(f"dictation: server did not understand {cmd!r}")
         return 2
